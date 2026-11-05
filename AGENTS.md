@@ -83,7 +83,7 @@ Lean 自动加载第 0 章核心与专项目录；第 1–8 章由模型按任�
 - 每次 `bash` 以独立 shell 运行，显式传 `workdir`；长任务按实际能力后台运行并收集输出。
 - 输出可能很大的命令按**字节**封顶，并保住退出码：默认 `tmp=$(mktemp); 命令 >"$tmp" 2>&1; s=$?; tail -c 4000 "$tmp"; rm -f "$tmp"; exit $s`。`tail -c` 可直接接管道（读到 EOF，不触发 SIGPIPE）；**不要**用 `bash -o pipefail -c '… | head -c N'`——上游被 SIGPIPE 杀掉会返回 141，把成功命令报成失败。行数上限（`head -n 20`）不安全，单行可能极长。
 - 相互独立且无依赖的检查，在宿主支持时同轮并行发起。
-- 重启本机 dsh host（`com.zhangjiazhi.dsh-web`）一律用 `~/.dsh/bin/dsh-web-restart-safe.sh [延迟秒]`。它写自清理 LaunchAgent（RunAtLoad、无 KeepAlive），跑完自动卸载并删 plist。**禁止用 `launchctl submit` 排延迟重启**：该命令已废弃且默认带 KeepAlive，脚本正常结束后会被反复拉起，形成 31 秒一轮的重启风暴，并不断打断正在进行的会话 turn（2026-09-15 连续复发两次）。重启会杀掉宿主、终结当前 turn，故必须在回复落地后再触发，延迟至少 60 秒。
+- 重启本机 dsh host（`com.USER.dsh-web`）一律用 `~/.dsh/bin/dsh-web-restart-safe.sh [延迟秒]`。它写自清理 LaunchAgent（RunAtLoad、无 KeepAlive），跑完自动卸载并删 plist。**禁止用 `launchctl submit` 排延迟重启**：该命令已废弃且默认带 KeepAlive，脚本正常结束后会被反复拉起，形成 31 秒一轮的重启风暴，并不断打断正在进行的会话 turn（2026-09-15 连续复发两次）。重启会杀掉宿主、终结当前 turn，故必须在回复落地后再触发，延迟至少 60 秒。
 - 宿主核心与 web profile 落在两棵树（版本树 + pnpm hoisted 的 profile），同一 `@deepseek-ai` 包可能被加载两份，使模块级 Symbol（如 `dsh-scope` 的 `kScope`）身份失配 —— 表现为工具注册撞名、**新会话与 resume 全部失败且 UI 只显示 `Session unavailable`**。`dsh-web-launchd.sh` 的 preboot 已自动跑 `dsh-dedupe-core-modules.sh` 兜住；**升级宿主版本后必复发**，若见到上述症状先重跑该脚本并确认 profile 内链接指向当前版本树。注意判据是**模块实例数**，不是文件内容（两份 md5 相同也照样失配）。
 - 逆向类任务先按目标分流，别让 REA 技能与 `reverse-pentest` 同时主导流程：原生二进制、Electron/JS、.NET、APK、固件、抓包、WASM/EVM 等「要看产物或运行时证据」的逆向走 REA（有 `tool_gateway` 时用它搜索/调用 `mcp__rea__*`，没有 gateway 时用 `dev_tool_search` 解锁；Ghidra 已配好 12.1.3，IDA 走 attached 需 GUI 里开着原始二进制）；Web/API 渗透与客户端许可校验绕过走 `reverse-pentest`（REA 明确不覆盖破解/绕过许可）。REA 与 `mcp__ida-pro-mcp` 都能驱动同一个 IDA GUI，同一时间只用一边。
 

@@ -72,7 +72,8 @@ cache/lean-config-schema.json →  ~/.dsh/cache/lean-config-schema.json
 
 本仓库发布前已脱敏：
 
-- 所有本机绝对路径 `/Users/zhangjiazhi` 替换为 `/Users/USER`（248 处 / 21 文件）
+- 所有本机绝对路径 `/Users/<本机用户名>` 统一替换为 `/Users/USER`（248 处 / 21 文件）
+- LaunchAgent 标识 `com.<本机用户名>.dsh-web` 替换为 `com.USER.dsh-web`
 - 未包含 `research-*/`、`_archive-*/`、`.maintenance/`（内部会话原始日志，含内网地址等）
 - 复核结果：token / API key / 私钥 / 内网 IP / 邮箱 / 明文密码 **均为 0 命中**
 
