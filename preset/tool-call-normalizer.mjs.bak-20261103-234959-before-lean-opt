@@ -1,0 +1,170 @@
+/**
+ * 20261017-audit-p1 — normalize model-generated tool arguments at the pipeline
+ * boundary, before each tool's own JSON-schema validation.
+ *
+ * `tools/execute` is the documented around-dispatch hook: it runs after
+ * `tools/pre-execute` (allow/deny/ask) and before `tool.execute(args)`, where
+ * `defineTool` validates required fields. Replacing `exec.arguments` here is
+ * therefore the correct place for defaults/cleanup that should be invisible to
+ * the tool body and to the model's next retry.
+ *
+ * What it fixes (October counts from 471 lean sessions):
+ *  - bash: 47 `missing required property "description"` calls. `description`
+ *    is UI metadata; derive a one-line default from the command.
+ *  - bash: 32 `invalid justification` + 16 `not strictly wider` + 6 invalid
+ *    `sandbox_permissions`. Escalation is optional: never send it without a
+ *    non-empty justification, and drop invalid/orphan permission fields so the
+ *    command runs under the current sandbox instead of failing the call.
+ *  - subagent: 26 `provider must be non-empty` + 3 `reasoning_effort` empty.
+ *    Empty route fields are semantically "omitted" (inherit parent); delete
+ *    them before the tool rejects the call.
+ *  - read/edit/write/read_image/glob/grep/bash workdir: expand a leading `~`,
+ *    which the filesystem tools do not do themselves.
+ *
+ * It deliberately does NOT rewrite paths that merely contain `~` after a
+ * prefix (`project/~/...`): that is a malformed path, not a home reference.
+ */
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+export const name = 'lean-tool-call-normalizer'
+export const inject = []
+
+const SANDBOX_PERMISSIONS = new Set(['workspace-write', 'danger-full-access'])
+const ESCALATION_TOOLS = new Set(['bash', 'write', 'edit', 'str_replace_editor'])
+const SANDBOX_MODE_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 }
+const PATH_FIELDS = {
+  bash: ['workdir'],
+  read: ['file_path'],
+  write: ['file_path'],
+  edit: ['file_path'],
+  str_replace_editor: ['path'],
+  read_image: ['file_path'],
+  glob: ['path'],
+  grep: ['path'],
+}
+
+const nonEmpty = value => typeof value === 'string' && value.trim().length > 0
+
+const defaultDescription = command => {
+  const line = String(command ?? '').trim().split('\n')[0].trim()
+  return line === '' ? 'Run a shell command' : `Run ${line.slice(0, 80)}`
+}
+
+const expandHome = value => {
+  if (value === '~') return homedir()
+  if (value.startsWith('~/')) return join(homedir(), value.slice(2))
+  return value
+}
+
+const strictlyWider = (requested, effective) => {
+  const requestedRank = SANDBOX_MODE_RANK[requested]
+  const effectiveRank = SANDBOX_MODE_RANK[effective]
+  // Unknown modes are left to the sandbox service; never guess a downgrade.
+  return requestedRank === undefined || effectiveRank === undefined || requestedRank > effectiveRank
+}
+
+/** Pure argument normalizer, exported for regression tests. */
+export function normalizeToolArguments(name, args, effectiveMode) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
+  let next = args
+  const mutate = () => {
+    if (next === args) next = { ...args }
+    return next
+  }
+  if (name === 'bash') {
+    const normalized = mutate()
+    if (!nonEmpty(normalized.description)) normalized.description = defaultDescription(normalized.command)
+  }
+  if (ESCALATION_TOOLS.has(name)) {
+    const normalized = mutate()
+    if (!SANDBOX_PERMISSIONS.has(normalized.sandbox_permissions) || !nonEmpty(normalized.justification) || (effectiveMode !== undefined && !strictlyWider(normalized.sandbox_permissions, effectiveMode))) {
+      // Escalation without a reason must not reach the approval path. Dropping
+      // it is safe: the operation runs under the current sandbox and can be
+      // retried with an explicit justification if the sandbox actually denies it.
+      delete normalized.sandbox_permissions
+      delete normalized.justification
+    }
+  }
+  if (name === 'subagent' || name === 'subagent_fork' || name === 'list_subagent_models') {
+    for (const field of ['provider', 'model', 'reasoning_effort']) {
+      if (typeof next[field] === 'string' && !nonEmpty(next[field])) {
+        const normalized = mutate()
+        delete normalized[field]
+      }
+    }
+  }
+  for (const field of PATH_FIELDS[name] ?? []) {
+    if (typeof next[field] === 'string') {
+      const expanded = expandHome(next[field])
+      if (expanded !== next[field]) {
+        const normalized = mutate()
+        normalized[field] = expanded
+      }
+    }
+  }
+  return next
+}
+
+const FILE_EDIT_HINTS = [
+  [/file has not been read/i, 'Hint: call the `read` tool on this file first; output from bash `sed`/`grep`/`cat` does not satisfy the read-before-edit check.'],
+  [/file changed since it was read/i, 'Hint: call `read` again before editing; the file changed on disk after your last read.'],
+  [/old_string was not found/i, 'Hint: re-read the exact region with `read` and copy the literal text; whitespace and line endings must match.'],
+  [/old_string and new_string must differ/i, 'Hint: use a different `new_string`; to delete the matched text, pass an empty string.'],
+]
+
+const resultText = (result) => {
+  const parts = Array.isArray(result?.content)
+    ? result.content.filter(block => block?.type === 'text').map(block => block.text)
+    : []
+  if (typeof result?.error?.message === 'string') parts.push(result.error.message)
+  return parts.join('\n')
+}
+
+const editHintFor = (result) => {
+  if (result?.isError !== true && result?.error === undefined) return undefined
+  const text = resultText(result)
+  return FILE_EDIT_HINTS.find(([pattern]) => pattern.test(text))?.[1]
+}
+
+const BASH_TTY_HINT = 'Hint: this command needs an interactive TTY/stdin. Plain bash cannot answer prompts; unlock terminal_* with dev_tool_search({toolNames:["terminal"]}) instead of retrying bash.'
+const BASH_TIMEOUT_HINT = 'Hint: for long-running work use bash run_in_background + job_output; if it needs interaction, unlock terminal_* instead.'
+
+const bashHintFor = (result) => {
+  if (result?.isError !== true && result?.error === undefined) return undefined
+  const text = resultText(result)
+  if (/not a tty|stdin is not a tty|no tty|requires? (?:an? )?(?:interactive )?tty|interactive terminal/i.test(text)) return BASH_TTY_HINT
+  // Do not turn a schema/argument error (`invalid timeoutMs`) into a
+  // long-running-work hint. Only match actual execution-timeout markers.
+  if (/\btimed out\b|deadline exceeded|timeout exceeded|Command timed out or OOM|PERSISTENT_BASH_TIMEOUT/i.test(text)
+    && !/invalid timeoutMs|timeoutMs must|expected a positive number/i.test(text)) return BASH_TIMEOUT_HINT
+  return undefined
+}
+
+const withHint = (result, hint) => {
+  if (hint === undefined || result === null || typeof result !== 'object' || resultText(result).includes(hint)) return result
+  return { ...result, content: [...(Array.isArray(result.content) ? result.content : []), { type: 'text', text: hint }] }
+}
+
+export function apply(ctx) {
+  const sandboxPolicy = typeof ctx.get === 'function' ? ctx.get('sandboxPolicy') : undefined
+  const effectiveModeOf = (exec) => {
+    if (sandboxPolicy === undefined || exec?.agent?.session === undefined) return undefined
+    try {
+      return sandboxPolicy.resolve({ session: exec.agent.session }).mode
+    } catch {
+      return undefined
+    }
+  }
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec !== null && typeof exec === 'object' && exec.arguments !== null && typeof exec.arguments === 'object') {
+      const normalized = normalizeToolArguments(exec.name, exec.arguments, effectiveModeOf(exec))
+      if (normalized !== exec.arguments) exec.arguments = normalized
+    }
+    const result = await next()
+    let hint
+    if (exec?.name === 'bash') hint = bashHintFor(result)
+    else if (['edit', 'write', 'str_replace_editor'].includes(exec?.name)) hint = editHintFor(result)
+    return withHint(result, hint)
+  })
+}

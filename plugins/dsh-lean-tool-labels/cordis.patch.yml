@@ -1,0 +1,8 @@
+# @local/dsh-lean-tool-labels: short card labels for the lean preset's own tools.
+# Mounting this host plugin publishes the package's client face; the client half
+# registers keyed `tool.call.toolview` entries for `rule_load` and
+# `dev_tool_search` so those rows show a one-line Chinese summary instead of the
+# generic row's raw argument JSON. No shipped bundle is patched.
+- insert:
+    - id: lean-tool-labels
+      name: '@local/dsh-lean-tool-labels'

@@ -1,0 +1,229 @@
+/**
+ * Stable single-entry capability gateway for the LEAN preset (2026-10-29).
+ *
+ * The model sees one `tool_gateway` schema plus the fixed resident core. Every
+ * on-demand tool (MCP/browser/skill/memory/subagent/…) is hidden from
+ * `request.tools`, so unlocking a capability no longer changes the request
+ * prefix. The gateway resolves a private catalog and delegates through the
+ * public `ctx.tools.execute()` pipeline, preserving pre-execute policy,
+ * approval, guards and post-execute handling.
+ *
+ * Deliberately dependency-free: preset-local modules can only resolve relative
+ * files, so the definition is hand-built instead of importing `defineTool`.
+ */
+
+export const name = 'tool-gateway'
+
+/** The tool registry must exist before this tool can register. */
+export const inject = ['tools']
+
+import { isGatewayEligible, originalWhenFor } from './gateway-policy.mjs?release=20261029-gateway3'
+
+const GATEWAY_NAME = 'tool_gateway'
+const MAX_LIST = 80
+const MAX_SEARCH = 25
+const MAX_LIST_CHARS = 7000
+const MAX_SEARCH_CHARS = 5000
+const MAX_DESCRIPTION = 220
+
+const textOf = (value) => (typeof value === 'string' ? value : '')
+
+const clip = (value, limit = MAX_DESCRIPTION) => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length <= limit ? text : `${text.slice(0, limit - 3)}...`
+}
+
+/** Build the private catalog: global registrations plus this agent's scoped ones. */
+const catalogFor = (ctx, agent) => {
+  const definitions = new Map()
+  const add = (entries) => {
+    for (const [name, definition] of entries) {
+      if (name === GATEWAY_NAME) continue
+      // Only definitions tool-bootstrap intentionally hid are gateway-visible.
+      // A definition with its own `when` stays out: no step modelSelection here.
+      if (!isGatewayEligible(definition) || originalWhenFor(definition) !== undefined) continue
+      definitions.set(name, definition)
+    }
+  }
+  add(ctx.tools.view().visible)
+  if (agent !== undefined && agent !== null) add(ctx.tools.view(agent).visible)
+  return definitions
+}
+
+/** A step-like tool set accepted by ctx.tools.execute(). */
+const privateToolSet = (definitions, agent) => ({
+  dispose() {},
+  view(scope) {
+    return scope === agent ? definitions : new Map()
+  },
+})
+
+/** Preserve the hidden tool's canonical content, including image/file blocks. */
+const resultValue = (settled) => {
+  const result = settled?.results?.[0]?.result
+  if (result === undefined) return { text: 'Error: tool produced no result' }
+  const content = Array.isArray(result.content) ? result.content : undefined
+  const text = (content ?? [])
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n')
+  if (result.isError === true) {
+    const message = `Error: ${textOf(result.error?.message) || text || 'tool failed'}`
+    return {
+      content: [{ type: 'text', text: message }, ...(content ?? [])],
+      text: message,
+    }
+  }
+  if (content !== undefined && content.length > 0) return { content, ...(text.length > 0 ? { text } : {}) }
+  if (result.value !== undefined) return { text: JSON.stringify(result.value, null, 2) }
+  return { text: '(tool completed with no output)' }
+}
+
+const collectLines = (entries, limit, budget) => {
+  const lines = []
+  let chars = 0
+  for (const [toolName, definition] of entries) {
+    if (lines.length >= limit) break
+    const line = `- ${toolName}: ${clip(definition?.description)}`
+    if (lines.length > 0 && chars + line.length > budget) break
+    lines.push(line)
+    chars += line.length + 1
+  }
+  return { lines, omitted: Math.max(0, entries.length - lines.length) }
+}
+
+const listText = (definitions) => {
+  const entries = [...definitions.entries()].sort(([a], [b]) => a.localeCompare(b))
+  if (entries.length === 0) return 'No gateway-eligible tools registered.'
+  const { lines, omitted } = collectLines(entries, MAX_LIST, MAX_LIST_CHARS)
+  if (omitted > 0) lines.push(`... (+${omitted} more; use search)`)
+  return lines.join('\n')
+}
+
+const searchText = (definitions, query) => {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
+  const scored = []
+  for (const [toolName, definition] of definitions.entries()) {
+    const name = toolName.toLowerCase()
+    const description = String(definition?.description ?? '').toLowerCase()
+    let score = 0
+    let matches = true
+    for (const term of terms) {
+      const inName = name.includes(term)
+      const inDescription = description.includes(term)
+      if (!inName && !inDescription) { matches = false; break }
+      score += inName ? 3 : 1
+    }
+    if (matches) scored.push({ toolName, definition, score })
+  }
+  if (scored.length === 0) return `No gateway-eligible tools match "${query}". Try list.`
+  scored.sort((a, b) => b.score - a.score || a.toolName.localeCompare(b.toolName))
+  const entries = scored.map(item => [item.toolName, item.definition])
+  const { lines, omitted } = collectLines(entries, MAX_SEARCH, MAX_SEARCH_CHARS)
+  if (omitted > 0) lines.push(`... (+${omitted} more; narrow the query)`)
+  return lines.join('\n')
+}
+
+const definition = (ctx) => ({
+  name: GATEWAY_NAME,
+  description: [
+    '`tool_gateway`: stable capability gateway for on-demand LEAN tools. The resident catalog stays fixed; use this tool to search/call every tool that is not shown directly.',
+    'ALWAYS SEARCH FIRST: call action="search" with a short family/keyword query before doing anything else. Do NOT call list first; use list only after search has no useful hit. list can return up to 80 entries and costs history tokens.',
+    'If arguments are unknown, use action="describe" with name first, then action="call" with the exact name and input. The call still goes through normal approval and policy.',
+    'Do not use this for high-frequency core tools when they are already visible; call them directly.',
+    '',
+    'Fixed family index (use search for exact names; all are gateway-only unless already visible):',
+    'browser/playwright (mcp__playwright-mcp__*); skill (skill_search/skill_load); memory (memory_*);',
+    'subagent/fork/ralph/workflow; goal/job (create_goal, get_goal, update_goal, job_*);',
+    'MCP (mcp__<server>__*); cordis/dev (cordis_inspect_*, dev_*); terminal (terminal_*);',
+    'session/history (session_*, search_history, history_context); rules/present/batch;',
+    'teams are an explicit-turn exception and may already be visible.',
+  ].join('\n'),
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['search', 'describe', 'call', 'list'],
+        description: 'Discovery first: search. Then describe if the input shape is unknown, then call.',
+      },
+      query: { type: 'string', description: 'Short family/keyword query for search.' },
+      name: { type: 'string', description: 'Exact gateway-eligible tool name for describe/call.' },
+      input: { type: 'object', additionalProperties: true, description: 'Arguments object for the hidden tool.' },
+    },
+    required: ['action'],
+  },
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        text: { type: 'string' },
+        content: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      },
+    },
+    render: (_args, value) => (
+      Array.isArray(value.content) && value.content.length > 0
+        ? value.content
+        : [{ type: 'text', text: value.text ?? '(tool completed with no output)' }]
+    ),
+  },
+  async execute(args, exec) {
+    const action = args?.action
+    const definitions = catalogFor(ctx, exec?.agent)
+    if (action === 'list') return { text: listText(definitions) }
+    if (action === 'search') {
+      const query = typeof args.query === 'string' ? args.query.trim() : ''
+      if (query.length === 0) return { text: 'Provide a non-empty query for search, or use action="list".' }
+      return { text: searchText(definitions, query) }
+    }
+    if (action === 'describe') {
+      const toolName = typeof args.name === 'string' ? args.name.trim() : ''
+      if (toolName.length === 0) return { text: 'Provide the exact tool name for action="describe".' }
+      const target = definitions.get(toolName)
+      if (target === undefined) return { text: `Unknown tool "${toolName}". Use action="search" or action="list" first.` }
+      return {
+        text: JSON.stringify({
+          name: toolName,
+          description: target.description,
+          parameters: target.parameters,
+        }, null, 2),
+      }
+    }
+    if (action !== 'call') return { text: `Unknown action: ${String(action)}` }
+
+    const toolName = typeof args.name === 'string' ? args.name.trim() : ''
+    if (toolName.length === 0) return { text: 'Provide the exact tool name for action="call".' }
+    if (toolName === GATEWAY_NAME) return { text: 'tool_gateway cannot call itself.' }
+    if (!definitions.has(toolName)) {
+      return { text: `Unknown tool "${toolName}". Use action="search" or action="list" to find the exact name.` }
+    }
+    const input = args.input
+    if (input !== undefined && (input === null || typeof input !== 'object' || Array.isArray(input))) {
+      return { text: 'input must be a JSON object.' }
+    }
+    try {
+      const settled = await ctx.tools.execute({
+        calls: [{
+          id: `gateway-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          name: toolName,
+          arguments: JSON.stringify(input ?? {}),
+        }],
+        agent: exec.agent,
+        signal: exec.signal,
+        toolSet: privateToolSet(definitions, exec.agent),
+      })
+      for (const context of settled.additionalContexts ?? []) exec.deferContext(context)
+      if (settled.concluded === true) exec.concludeTurn()
+      return resultValue(settled)
+    } catch (error) {
+      return { text: `Error: ${String(error?.message || error)}` }
+    }
+  },
+})
+
+/** Register one fixed-schema gateway; the private catalog is resolved per call. */
+export function apply(ctx) {
+  ctx.tools.register(definition(ctx))
+}

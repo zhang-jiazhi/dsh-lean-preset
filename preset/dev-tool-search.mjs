@@ -1,0 +1,786 @@
+/**
+ * dev-tool-search — on-demand tool discovery and unlock, the tool-search
+ * pattern for the anchored preset.
+ *
+ * Copied from xiaobright/dsh-anchored-standard (MIT; see NOTICE in this
+ * repository), with the resident-set description adapted to this preset's
+ * whitelist.
+ *
+ * The promoted phase keeps only a minimal resident set (see lean.patch.yml
+ * `residentTools`) instead of dumping the whole catalog at once. This plugin
+ * registers ONE small tool:
+ *
+ *  - `dev_tool_search` — search the FULL assembled catalog by keyword and
+ *    return matching tool names with short descriptions; optionally unlock
+ *    tools by exact name (array `toolNames`). Unlocked names are recorded as
+ *    durable `tool/call` arguments, and tool-bootstrap.mjs's assemble filter
+ *    exposes them from the next request on (resume-safe).
+ *
+ * The tool description is deliberately an INDEX of what the minimal resident
+ * set cannot do: the model should reach for dev_tool_search the moment a task
+ * needs internet, delegation, workflows, goals, images, background jobs, or
+ * multi-agent coordination — not try to work around them with bash.
+ */
+
+import { resolveToolNames, schemaSizer, formatChars } from './tool-name-resolver.mjs?release=20261024-unlockbudget'
+import { catalogFor } from './catalog-cache.mjs?release=20261028-022-exposure'
+
+/** Cordis plugin name used by loader diagnostics. */
+export const name = 'dev-tool-search'
+
+/** The tools registry must exist before this tool can register. */
+export const inject = ['tools']
+
+/** Named task-level bundles: one user-facing word expands to its family. */
+export const TOOL_BUNDLES = {
+  // Smallest complete set for one interactive shell: open/send/read/signal/close.
+  // terminal_list is optional (the model gets the id from terminal_open).
+  terminal: ['terminal_open', 'terminal_send', 'terminal_read', 'terminal_signal', 'terminal_close'],
+  // Core page loop; browser_login/browser_tabs remain available as exact unlocks.
+  browser: ['browser_navigate', 'browser_snapshot', 'browser_act', 'browser_eval', 'browser_screenshot'],
+  // Playwright MCP family. It is auto-mounted by the desktop profile but its
+  // schemas are hidden until this bundle (or a matching exact name) is unlocked.
+  playwright: [
+    'mcp__playwright-mcp__browser_click',
+    'mcp__playwright-mcp__browser_close',
+    'mcp__playwright-mcp__browser_console_messages',
+    'mcp__playwright-mcp__browser_drag',
+    'mcp__playwright-mcp__browser_drop',
+    'mcp__playwright-mcp__browser_evaluate',
+    'mcp__playwright-mcp__browser_file_upload',
+    'mcp__playwright-mcp__browser_fill_form',
+    'mcp__playwright-mcp__browser_find',
+    'mcp__playwright-mcp__browser_handle_dialog',
+    'mcp__playwright-mcp__browser_hover',
+    'mcp__playwright-mcp__browser_navigate',
+    'mcp__playwright-mcp__browser_navigate_back',
+    'mcp__playwright-mcp__browser_network_request',
+    'mcp__playwright-mcp__browser_network_requests',
+    'mcp__playwright-mcp__browser_press_key',
+    'mcp__playwright-mcp__browser_resize',
+    'mcp__playwright-mcp__browser_run_code_unsafe',
+    'mcp__playwright-mcp__browser_select_option',
+    'mcp__playwright-mcp__browser_snapshot',
+    'mcp__playwright-mcp__browser_tabs',
+    'mcp__playwright-mcp__browser_take_screenshot',
+    'mcp__playwright-mcp__browser_type',
+    'mcp__playwright-mcp__browser_wait_for',
+  ],
+  history: ['session_search', 'search_history', 'history_context'],
+  // REA (reverse-engineering MCP) core binary workflow. Deliberately six exact
+  // tools, not the 207-tool mcp__rea family (which is ~832k schema chars).
+  rea: [
+    'mcp__rea__binary_session',
+    'mcp__rea__open_binary',
+    'mcp__rea__search_procedures',
+    'mcp__rea__binary_overview',
+    'mcp__rea__analyze_function',
+    'mcp__rea__close_binary',
+  ],
+}
+
+const DEFAULT_LIMIT = 25
+const MAX_LIMIT = 100
+const RESULT_TEXT_BUDGET = 3800
+const MAX_QUERY_LENGTH = 128
+const RESULT_NAME_LIMIT = 256
+const RESULT_NAME_LIST_LIMIT = 512
+const RESULT_DESCRIPTION_LIMIT = 90
+const PAGE_FURNITURE_RESERVE = 720
+// 20261017-audit-p1: match only the leading summary of a description. Long
+// usage sections (batch alone is 3.4k chars) otherwise make one generic tool
+// match almost every query: October had batch in 28 of 64 query pages.
+const SEARCH_SUMMARY_CHARS = 240
+// Broad "match any keyword" fallback returns the whole catalog on natural-
+// language queries (p90 42, max 144 in October). Keep the best few and ask for
+// a narrower query instead of spending the 3,800-char page budget on noise.
+export const RELAXED_MATCH_LIMIT = 12
+const OUTPUT_TRUNCATION_NOTICE = '... [additional discovery output omitted to stay within the response budget]'
+
+const budgetText = (lines, budget = RESULT_TEXT_BUDGET) => {
+  const text = lines.join('\n')
+  if (text.length <= budget) return text
+  const available = Math.max(0, budget - OUTPUT_TRUNCATION_NOTICE.length - 1)
+  return `${text.slice(0, available)}\n${OUTPUT_TRUNCATION_NOTICE}`
+}
+
+const displayText = (value, limit) => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (text.length <= limit) return text
+  const notice = `... [${text.length} chars]`
+  return `${text.slice(0, Math.max(0, limit - notice.length))}${notice}`
+}
+
+const displayNames = (names, limit = RESULT_NAME_LIST_LIMIT) => {
+  const rendered = []
+  let length = 0
+  for (const name of names) {
+    const item = displayText(name, RESULT_NAME_LIMIT)
+    const separator = rendered.length === 0 ? '' : ', '
+    if (length + separator.length + item.length > limit) break
+    rendered.push(item)
+    length += separator.length + item.length
+  }
+  if (rendered.length === names.length) return rendered.join(', ')
+  const omitted = `... (+${names.length - rendered.length} more)`
+  return rendered.length === 0 ? omitted : `${rendered.join(', ')}, ${omitted}`
+}
+
+/**
+ * Suggest catalog names close to a missing unlock name (20260926-suggest).
+ *
+ * Measured on 228 real unlock calls: 36 returned "No tools match" (15.8%),
+ * almost always a plausible-but-absent exact name (`mcp__github__get_issue`
+ * when the server names it differently) or a group pattern while the server
+ * had no tools in the catalog yet. Each failure costs the model a follow-up
+ * round; suggesting the closest real names turns that round into a same-call
+ * correction.
+ */
+const nameParts = (value) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+
+/** Dice coefficient over character bigrams — catches transposition typos
+ *  (memory_serach → memory_search ≈ 0.83) that exact-part matching misses. */
+const bigramDice = (a, b) => {
+  const bigrams = (s) => {
+    const set = new Set()
+    for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2))
+    return set
+  }
+  const sa = bigrams(a.toLowerCase())
+  const sb = bigrams(b.toLowerCase())
+  if (sa.size === 0 || sb.size === 0) return 0
+  let shared = 0
+  for (const gram of sa) if (sb.has(gram)) shared += 1
+  return (2 * shared) / (sa.size + sb.size)
+}
+
+/**
+ * 名称相似度兜底（20260930-recall）：查询词一个都没命中时，按 bigram Dice
+ * 在**工具名**上找最接近的几个，而不是直接回一句"没有结果"。
+ * 只比名字、不比描述——描述是全量文本，模糊比对会产生大量噪声。
+ */
+const fuzzyByName = (schemas, groups, threshold = 0.5) => {
+  const tokens = groups.flat().filter((token) => token.length >= 3)
+  if (tokens.length === 0) return []
+  return schemas
+    .map((schema) => {
+      const parts = nameParts(schema.name)
+      let best = 0
+      for (const token of tokens) {
+        for (const part of parts) {
+          const dice = bigramDice(token, part)
+          if (dice > best) best = dice
+        }
+      }
+      return { schema, score: best }
+    })
+    .filter((entry) => entry.score >= threshold)
+    .sort((a, b) => b.score - a.score || 0)
+    .map((entry) => entry.schema)
+}
+
+/**
+ * 长中文短语兜底（20260930-recall）：像「找文章对比」这样的整串，既没有别名，
+ * 也不会原样出现在任何描述里，于是前面几档全落空。它的**子串**往往能命中
+ * （文章 / 对比），所以退到 2-gram：按命中的 gram 数排序。
+ * 只在前面几档都无结果时启用，不影响精确查询的排序。
+ */
+const cjkGramMatch = (schemas, groups, haystackOf) => {
+  const grams = new Set()
+  for (const token of groups.flat()) {
+    if (!/[\u4e00-\u9fff]/.test(token) || token.length < 2) continue
+    for (let i = 0; i + 2 <= token.length; i += 1) grams.add(token.slice(i, i + 2))
+  }
+  if (grams.size === 0) return []
+  return schemas
+    .map((schema) => {
+      const hay = haystackOf(schema)
+      let hits = 0
+      for (const gram of grams) if (hay.includes(gram)) hits += 1
+      return { schema, hits }
+    })
+    .filter((entry) => entry.hits > 0)
+    .sort((a, b) => b.hits - a.hits || 0)
+    .map((entry) => entry.schema)
+}
+
+const suggestNames = (missing, catalogNames) => {
+  if (missing.startsWith('mcp__')) {
+    const segments = missing.split('__')
+    const server = segments[1]
+    const family = catalogNames.filter((candidate) => candidate.startsWith(`mcp__${server}__`))
+    if (family.length === 0) {
+      return { kind: 'server-down', family }
+    }
+    // Only DISTINCTING parts count (everything after mcp__<server>__); a bare
+    // namespace match would recommend arbitrary family members for any guess.
+    const distinguishing = new Set(nameParts(segments.slice(2).join('_')))
+    const scored = family
+      .map((candidate) => {
+        let overlap = 0
+        for (const part of nameParts(candidate.split('__').slice(2).join('_'))) if (distinguishing.has(part)) overlap += 1
+        return { candidate, overlap }
+      })
+      .filter(({ overlap }) => overlap >= 1)
+      .sort((a, b) => b.overlap - a.overlap || a.candidate.localeCompare(b.candidate))
+      .slice(0, 3)
+      .map(({ candidate }) => candidate)
+    return { kind: scored.length > 0 ? 'names' : 'family', family: scored }
+  }
+  const scored = catalogNames
+    .filter((candidate) => !candidate.startsWith('mcp__'))
+    .map((candidate) => ({ candidate, dice: bigramDice(missing, candidate) }))
+    .filter(({ dice }) => dice >= 0.45)
+    .sort((a, b) => b.dice - a.dice || a.candidate.localeCompare(b.candidate))
+    .slice(0, 3)
+    .map(({ candidate }) => candidate)
+  return { kind: scored.length > 0 ? 'names' : 'none', family: scored }
+}
+
+/** Minimal JSON schema compiler for tool parameters (zero dependencies). */
+function toJsonSchema(spec) {
+  const properties = {}
+  const required = []
+  for (const [key, meta] of Object.entries(spec || {})) {
+    const prop = { type: meta.type }
+    if (meta.description) prop.description = meta.description
+    if (meta.items) prop.items = meta.items
+    for (const key of ['minimum', 'maximum', 'default']) {
+      if (meta[key] !== undefined) prop[key] = meta[key]
+    }
+    properties[key] = prop
+    if (meta.required) required.push(key)
+  }
+  return { type: 'object', properties, required, additionalProperties: false }
+}
+
+/**
+ * The capability index: resident tools (bash / str_replace_editor /
+ * read/write/edit/glob/grep / todo_write / ask_user_question /
+ * dev_tool_search / exit_plan_mode) cannot cover these, so the model must
+ * search and unlock them on demand. Kept in the description so the model
+ * KNOWS what exists without a full catalog dump.
+ *
+ * 2026-09-03 重写，对齐"全工具可用 + 极简思维链"初衷的两条纪律：
+ *   1. 每一行都对着本机 dsh 安装核过（dsh-* 包 + web profile 插件 +
+ *      local-plugins）；死条目 = 模型白费一轮解锁调用。
+ *   2. 索引只写"存在什么能力、何时该用"；API 用法细节属于解锁后的
+ *      schema，写在索引里是每请求重复付费。
+ *
+ * 2026-09-04 实测：本索引约 395 token/请求（CJK 感知口径：中文按 1.6
+ * 字符/token、拉丁按 4）。同口径下单个 bash schema 是 811 token、
+ * todo_write 是 303 —— 索引仅占 bash 的一半，**不是常驻目录的成本大头**，
+ * 因此这一轮只删真冗余（computer-use 的坐标契约已由其自身 30 个 schema
+ * 中的 18 个写明，实测 get_app_state/screenshot/zoom 描述均自带；另删
+ * 日期备注与 claude-opus 的赘述），共省 23 token。继续激进删减会牺牲
+ * 「模型知道有什么能力」这一索引的全部价值，收益却不足 6%，故停手。
+ *
+ * 2026-09-22 全量核对（逐名实测解锁）：删除两个从未有任何注册点的死条目
+ * （sidebar_open / terminal_* 九连——只在 client UI 字符串里存在；
+ * dev_config_effective——全盘零注册）；cordis_* 三个名字改成本版本真实
+ * 注册名 cordis_inspect_list / cordis_inspect_query；memory 补实册的
+ * memory_get / memory_runtime（7→9）。另同步恢复三组被 disabled 挡掉的
+ * 真实工具（ralph / mcp__computer-use__* / mcp__blender__*），索引承诺
+ * 与装配现状一一对应。新增 tests/index-consistency.test.mjs 静态守门。
+ *
+ * 20260926-indexresync：索引/描述与 9-25/9-26 的配置改动重新同步 —— 守门
+ * 测试此前 2 红：① residentTools 已加入 send_message，但描述的常驻清单
+ * 仍为 13 名且索引把它列为"需解锁"，会诱导模型为已常驻工具白付一轮
+ * dev_tool_search；② mcp-computer-use / mcp-blender 已 disabled，索引仍
+ * 承诺对应族（9-22 正为此恢复过，停用时必须同步撤下）。改描述需换
+ * 入口 + release URL 绕 ESM 缓存。
+ *
+ * 20260926-suggest：missing 输出加近似名建议。实测 228 次解锁调用中 36 次
+ * "No tools match"（15.8%），几乎全是"像真名的猜测"（mcp__github__get_issue
+ * 实际叫别的）或 server 未连上时的整族名 —— 每次失败白付一轮追回。
+ * 现在同 call 直接给 closest 名单 / family 存在提示 / server-down 诊断，
+ * 把失败轮变成当轮纠正。
+ *
+ * 20260926-webab：web_search / web_fetch 常驻（A/B 配置 A）。描述常驻清单
+ * 补足 16 名、索引撤下 web 行 —— 常驻工具不进索引是 indexresync 确立的
+ * 同步纪律；否则模型会为已常驻工具白付解锁轮（send_message 的前车之鉴）。
+
+ * 20260930-recall：解决"解锁出现 No tools match"。实测 33 条真实问法 + 10 条
+ *   解锁猜测，三处结构性缺陷：① 只有"每词都中"一档，一个死词整条归零
+ *   （8/33 零结果）；② 本工具自己的描述为了做能力索引列全了关键词，于是任何
+ *   查询都把自己排进前列，污染大部分未命中的 top-3；③ 解锁只认精确名/尾部
+ *   通配/裸 MCP 族名，猜错即白付一轮（10 条里 6 条没定下来）。现在：分级放宽
+ *   （严格 AND → 命中任一 → 中文 2-gram → 名称相似度）、结果排除自身、无歧义
+ *   近失名当轮自动解析。实测 query 零结果 8→0、解锁当轮定下 4→9/10、死胡同
+ *   0。自动解析放在 tool-name-resolver.mjs（**共享给 tool-bootstrap 的装配
+ *   层**）——早先只写在发现工具里，会让"已解锁"的回报与真实装配不一致，被
+ *   既有的 agreement 守门测试当场抓住。歧义守门：非 MCP 要求唯一前缀或明显
+ *   领先（绝对差 0.08/相对 1.15/高分 0.75）；MCP 要求族内至少共享 2 个区分词，
+ *   避免一个通用词（issue）把 typo 静默指向写操作类工具。target 见
+ *   tests/recall-target.test.mjs。
+ * 20260930-webfetchback：**最终只撤 web_search**。web_fetch 已加回常驻（15 名）——
+ *   它承载「给我这个 URL 的正文」，撤掉后目录里只剩 translate_page（返回双语）与
+ *   browser_*（要开侧边栏）能替代，属真缺口；且它的每轮成本量不到（per-agent
+ *   注册 + 名字不在包源码里），无法用成本论证，故按能力覆盖决定留常驻。
+ *   web_fetch 回常驻后必须**同时从索引撤下**（常驻工具不进索引）。
+ *
+ * 20260930-webondemand：web_search / web_fetch 从两份清单撤下，改按需解锁
+ * （撤下前是 16 名常驻；理由：实测常驻目录每请求多付 1,600+ token，而联网
+ * 能力频率低）。纪律反向照办：撤常驻必须同时**把该能力加回索引**，否则等于
+ * 能力消失（read_page 那行随 modsearch 删除一并撤下，改由索引新增 web_search
+ * / web_fetch 与 tavily_search / anysearch_search / exa_search 两行顶上）。
+ *
+ * 20260930-nowebsearch：自带 web_search 从索引撤下、并停止注册（lean.patch.yml 的
+ *   tool-web 行加 `search: false`）。此前 20260930-webfetchback 只把它撤出常驻集，
+ *   它仍以"可解锁"身份留在目录里；而它与搜索三件套能力重叠，模型在"联网搜索"
+ *   这类问法上会先解锁它、白付一轮又拿不到三件套的路由权。纪律照旧：能力不注册
+ *   ⇒ 索引不得承诺（index-consistency 守门测试同步仍绿）；web_fetch 保持常驻、
+ *   继续不进索引。
+ *
+ * 20261017-deepseeksearch：新增 deepseek_search（DeepSeek 官方 Search API，由
+ *   @local/dsh-search-aggregator 的第 4 家 provider 注册）。仍按需解锁：只进索引，
+ *   不进 residentTools / compactionTools；index-consistency 的 HOST_LAYER_TOOLS
+ *   同步补名。能力已实测：真实端点 401 鉴权失败 → 工具层压成一句话可行动报错。
+ *
+ * 20260926-rank：搜索匹配按相关度排序（relevanceOf：name 命中 3 / description
+ * 命中 1 / name 前缀 +2，逐 AND 组取最优求和；同分保持目录序）。描述与 schema
+ * 不变，prompt 与目录构成零变化 —— 不影响在途 web A/B。读数：解锁失败率与
+ * "解锁后未用率"的后续趋势。
+ *
+ * 20260928-budgetindex：索引渲染改走预算路径（ZCode 技能目录同款）：单条
+ * 截断（INDEX_PER_ENTRY_CHARS）防未来单行膨胀；总预算（INDEX_BUDGET_CHARS）
+ * 超限降级为仅名字行（" — " 前段，按"；"再拆，防止一行多能力被静默丢名）。
+ * 当日实测：14 条 / 最长 236 / 总 1614 —— 全详情档字节等价，描述零变化，
+ * 不影响在途 web A/B。搜索匹配的是实时 catalog schema，不是这段文本，
+ * 截断不影响发现能力。
+ */
+export const UNLOCKABLE_INDEX = [
+  // 20261017-audit-p0：索引只承诺“当前 0.2.1 组合里真实存在”的家族。
+  // 旧索引承诺 mcp__playwright-mcp__* / mcp__playwright-persist__* / mcp__github__*
+  // 共 73 个工具，但 live catalog 里一个 mcp__ 工具都没有（server 静默失败）；
+  // 10 月 10 次 no-match 有 8 次是在反复猜这些不存在的名字。同时 browser_*、
+  // session_*、terminal_* 等真实工具完全没被索引。纪律：只承诺能搜到/能解锁的
+  // 家族；MCP 用一行通用说明，具体 server 由 query 发现。deepseek_fetch 暂不入
+  // 索引：源码已注册，但当前 live catalog 未列出，部署后再验证。
+  'subagent_fork / list_subagent_models — 子代理与路由；ralph — fresh-agent；workflow — 多代理编排',
+  'present — 需要声明最终交付物时用',
+  'create_goal / get_goal / update_goal / job_* — 目标与后台任务时用',
+  'memory_* — 需要跨会话记忆时用',
+  'skill_search / skill_load — 需要专用技能时用',
+  'rule_search — 需要搜全局规则章节时用',
+  'str_replace_editor — edit 无法按行插入时用',
+  'dev_* — 需要插件注入/重载/发布时用',
+  'cordis_inspect_list / cordis_inspect_query — 查宿主 Service/Event/Config/Tool/Slot 时用',
+  'batch — 程序化批量编排：一段 JS 编排多个工具，只回传聚合结果；多调用且只需聚合/中间结果大时用',
+  'browser_* — 操作网页/登录/点击/截图时用',
+  'playwright — Playwright 浏览器自动化（24 个 MCP 工具；默认隐藏，解锁后下一轮出现）',
+  'session_* — 查历史会话/事件时用',
+  'create_worktree / working_directory — 需要隔离工作区/git worktree 时用',
+  'search_history / history_context — 查过去对话/上下文时用',
+  'terminal_* — 交互式 stdin/REPL/TUI/多会话/持续观察时用；长任务非交互优先 bash 后台 job',
+  'translate_* — 翻译文本/网页时用',
+  'tavily_search / anysearch_search / exa_search / deepseek_search — 需要联网搜索时用',
+  'rea — REA 逆向核心 6 件；用 bundle 解锁，不要解锁 mcp__rea 整族（207 件/约 208k token）',
+  'mcp__<server>__* — 需要某 MCP server 时，先 query "<server>"，再按精确族解锁',
+]
+
+/**
+ * Budgeted rendering for the capability index (20260928-budgetindex).
+ *
+ * Mirrors ZCode's skill-catalog pattern: every entry carries a per-entry
+ * character cap, and when the rendered block exceeds the total budget the
+ * whole block degrades to name-only lines (the part before " — ", split on
+ * fullwidth "；" first so one line naming several capabilities keeps all of
+ * them; fragments without the " — " separator are description text and are
+ * dropped, never promoted to pseudo-names). Full guidance while it fits;
+ * pure actionable names when it does not.
+ *
+ * The budget is a one-shot threshold, not a hard cap on the degraded output:
+ * degradation does not re-measure. A runaway REAL index is caught earlier by
+ * the byte-equivalence test in tests/index-budget.test.mjs (full mode must
+ * match the legacy rendering while under budget) and by
+ * discovery-regression's description-length assertion — a real crossing
+ * red-flags for manual pruning instead of silently degrading.
+ *
+ * Search NEVER matches this text — execute() filters the live catalog
+ * schemas — so truncation cannot break discovery; only the model's upfront
+ * "when to use" hints shrink. Rendering is deterministic (no clock, stable
+ * order), so the schema string stays stable per build for prompt caching.
+ */
+export const INDEX_PER_ENTRY_CHARS = 250
+export const INDEX_BUDGET_CHARS = 2000
+
+const clampEntry = (text) => (text.length > INDEX_PER_ENTRY_CHARS ? `${text.slice(0, INDEX_PER_ENTRY_CHARS - 1)}…` : text)
+
+export function renderCapabilityIndex(entries = UNLOCKABLE_INDEX) {
+  const full = entries.map((entry) => `- ${clampEntry(entry)}`)
+  if (full.join('\n').length <= INDEX_BUDGET_CHARS) return full
+  const names = []
+  for (const entry of entries) {
+    for (const fragment of entry.split('；')) {
+      // Only a fragment that keeps the "names — description" convention yields
+      // a name. A bare fragment is continuation description text (the batch
+      // line's "；单一工具内的批量操作优先用…" would otherwise become a
+      // garbage pseudo-name line).
+      const at = fragment.indexOf(' — ')
+      if (at === -1) continue
+      const name = fragment.slice(0, at).trim()
+      if (name.length > 0) names.push(`- ${clampEntry(name)}`)
+    }
+  }
+  return names
+}
+
+/**
+ * Query tokenization. The original `/[^a-z0-9_]+/` split treated EVERY CJK
+ * character as a separator, so a Chinese query tokenized to `[]` and
+ * `[].every(...)` is vacuously true — the "search" returned the whole
+ * catalog truncated to 25 results (measured 2026-09-03). Unicode property
+ * escapes keep Chinese tokens so they substring-match descriptions that
+ * contain Chinese.
+ */
+/**
+ * CJK→English aliases for AND-token matching against mostly-English tool
+ * descriptions. A Chinese token WITH an alias is REPLACED by the alias words
+ * (the Chinese token itself would never match an English haystack under AND
+ * semantics); a Chinese token without an alias is kept as-is for substring
+ * matching against Chinese descriptions (skills are described in Chinese).
+ * Deliberately conservative: ambiguous words (代理/任务/代码) are excluded —
+ * a wrong alias silently zeroes out an AND query.
+ */
+const CJK_ALIASES = [
+  ['浏览器', 'browser'], ['网页', 'web'], ['联网', 'web'], ['搜索', 'search'],
+  ['桌面', 'desktop'], ['截图', 'screenshot'], ['屏幕', 'screen'], ['点击', 'click'],
+  ['子代理', 'subagent'], ['委派', 'subagent'], ['后台', 'background'],
+  ['记忆', 'memory'], ['技能', 'skill'], ['终端', 'terminal'], ['鼠标', 'mouse'],
+  ['键盘', 'keyboard'], ['剪贴板', 'clipboard'], ['窗口', 'window'],
+  ['待办', 'todo'], ['看图', 'image'], ['图片', 'image'],
+  ['仓库', 'github'], ['提交', 'commit'], ['议题', 'issue'], ['审查', 'review'],
+  ['工作流', 'workflow'], ['目标', 'goal'], ['插件', 'plugin'], ['注入', 'inject'], ['配置', 'config'],
+  ['批量', 'batch'],
+  // 20260930-recall：补高频但此前无别名的词。此前这类词（如「抓取」「检索」）
+  // 会作为中文串去子串匹配英文描述，必然零命中，而严格 AND 下一个死词即让
+  // 整条查询归零（实测 "抓取网页正文" 零结果）。放宽匹配后别名猜错的代价
+  // 也显著下降（最坏只是降级到"命中任一"），故这批值得加。
+  ['抓取', 'fetch'], ['读取', 'read'], ['检索', 'search'], ['新闻', 'news'],
+  ['翻译', 'translate'], ['历史', 'history'], ['会话', 'session'], ['文档', 'document'],
+  ['漏洞', 'cve'], ['行情', 'quote'], ['依赖', 'depend'], ['协议', 'protocol'],
+]
+
+/**
+ * Split concatenated CJK aliases while preserving ordinary whitespace and
+ * Latin tokens. For example, 浏览器截图 becomes [浏览器, 截图], while an
+ * unknown phrase remains one token and still matches Chinese descriptions.
+ */
+const aliasTerms = [...CJK_ALIASES].sort((a, b) => b[0].length - a[0].length).map(([term]) => term)
+const tokenize = (query) => {
+  const raw = query.toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter(Boolean)
+  const result = []
+  for (const token of raw) {
+    let rest = token
+    while (rest.length > 0) {
+      const at = aliasTerms
+        .map((term) => [term, rest.indexOf(term)])
+        .filter(([, index]) => index >= 0)
+        .sort((a, b) => a[1] - b[1] || b[0].length - a[0].length)[0]
+      if (at === undefined) {
+        result.push(rest)
+        break
+      }
+      const [term, index] = at
+      if (index > 0) result.push(rest.slice(0, index))
+      result.push(term)
+      rest = rest.slice(index + term.length)
+    }
+  }
+  return result
+}
+
+/**
+ * Expand a query into AND-groups of OR-candidates.
+ *
+ * Query  "桌面 截图"  →  groups [['desktop'], ['screenshot']]  →  a schema
+ * must mention desktop AND screenshot.
+ * Query  "表格"      →  groups [['xlsx','spreadsheet','excel']]  →  mention
+ * ANY of the three (a Chinese alias expands to several English synonyms that
+ * are alternatives, not conjuncts — flattening them into one AND-set made
+ * "表格" require a description containing xlsx AND spreadsheet AND excel,
+ * which no description does; the alias collapsed from OR to AND).
+ */
+const expandTokenGroups = (tokens) => {
+  const groups = []
+  for (const token of tokens) {
+    let candidates = null
+    for (const [cjk, english] of CJK_ALIASES) {
+      if (token.includes(cjk)) {
+        candidates = english.split(' ')
+        break
+      }
+    }
+    // No alias: the token itself is the only candidate (Chinese tokens still
+    // substring-match Chinese descriptions; English tokens match directly).
+    groups.push(candidates ?? [token])
+  }
+  return groups
+}
+
+/** Register the model-facing `dev_tool_search` tool. */
+export function apply(ctx) {
+  // 20260926-rank：匹配结果按相关度排序（此前按目录序切片，排前面的误匹配是
+  // 36 次失败解锁里"猜名字"的土壤）。计分：命中 name 计 3、命中 description
+  // 计 1、name 前缀命中再 +2，逐 AND 组取最优后求和；同分保持目录序（sort 稳定）。
+  const searchSummary = (schema) => (schema.description || '').slice(0, SEARCH_SUMMARY_CHARS).toLowerCase()
+  const relevanceOf = (schema, groups) => {
+    const name = (schema.name || '').toLowerCase()
+    const desc = searchSummary(schema)
+    let score = 0
+    for (const group of groups) {
+      let best = 0
+      for (const candidate of group) {
+        if (!candidate) continue
+        let s = 0
+        if (name.includes(candidate)) s += 3
+        if (desc.includes(candidate)) s += 1
+        if (name.startsWith(candidate)) s += 2
+        if (s > best) best = s
+      }
+      score += best
+    }
+    return score
+  }
+  ctx.tools.register({
+    name: 'dev_tool_search',
+    description: [
+      'Discover and unlock tools that are NOT currently available.',
+      '',
+      '常驻（直接调用，勿解锁）：bash, read, write, edit, todo_write, read_image, subagent, ask_user_question, dev_tool_search, exit_plan_mode, rule_load, send_message, web_fetch。其余能力按需解锁（grep/glob 自 20261103 起也在此列）：',
+      '',
+      'If the task needs one of the following, call dev_tool_search FIRST — do not work around it with bash:',
+      ...renderCapabilityIndex(),
+      '',
+      'If a resident tool would need repeated attempts, interactivity, or web/image/history/MCP work, search this index BEFORE falling back to bash/curl/grep.',
+      '',
+      'Already available? Call it directly. Unknown name? query first, never guess. Unlock the smallest complete set for the current task phase.',
+      '',
+      'If one turn needs many similar tool calls and you only need their aggregate — especially when the intermediate results are large — unlock `batch` and run one program instead of paying one round per call.',
+      '',
+      'Usage: `toolNames` alone unlocks known names; `query` searches names/descriptions; pass both in the SAME call to search and unlock. Prefer exact names; `*` unlocks a whole family and carries unused schemas. Unlock takes effect on the next request and lasts for the session. Bundles: `terminal`, `browser`, `playwright`, `history`, `rea` expand to their family (REA core = 6 exact tools). A group unlock is budgeted: a family adding >64 tools or ~60k schema chars is deferred whole, so ask for exact names instead.',
+    ].join('\n'),
+    parameters: toJsonSchema({
+      query: { type: 'string', required: false, description: 'search keywords (e.g. "web", "subagent")' },
+      toolNames: { type: 'array', required: false, description: 'exact tool names, bundle names (terminal/browser/playwright/history), or trailing-* group patterns to unlock', items: { type: 'string' } },
+      offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0, description: 'zero-based search result offset; does not affect toolNames' },
+      limit: { type: 'integer', minimum: 1, maximum: MAX_LIMIT, default: DEFAULT_LIMIT, description: 'search page size, 1-100 (default 25); does not affect toolNames' },
+    }),
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
+      render: (_a, v) => [{ type: 'text', text: v.text }],
+    },
+    async execute(args, exec) {
+      const query = typeof args.query === 'string' ? args.query.trim() : ''
+      const requestedUnlock = Array.isArray(args.toolNames) ? args.toolNames.filter((name) => typeof name === 'string' && name.length > 0) : []
+      const bundleNotes = []
+      const unlock = requestedUnlock.flatMap(name => {
+        const bundle = TOOL_BUNDLES[name]
+        if (bundle === undefined) return [name]
+        bundleNotes.push(`${name} → ${bundle.join(', ')}`)
+        return bundle
+      })
+
+      const lines = []
+      if (query.length === 0 && unlock.length === 0) {
+        lines.push('Provide `query` to search the catalog, or `toolNames` to unlock tools.')
+        return { text: lines.join('\n') }
+      }
+
+      try {
+        // 2026-10-28（dsh 0.2.2）：目录来源改为共享快照。
+        // 0.2.2 起工具可见性由 `ctx.tools.restrict()` 掩码控制，而掩码同时会把
+        // 被挡住的工具从 `tools.schemas(agent)` 里摘掉——若仍按 agent 视角读，
+        // 索引只能看到已暴露的那几个，解锁功能自己失明（issue #24 的老问题换了个形态）。
+        // tool-bootstrap 在 `turn/start` 先抬掩码、读一次完整目录再落掩码，并把这份
+        // 快照写进 catalog-cache.mjs；这里优先用快照，只有在快照缺失（例如工具调用
+        // 发生在首个 turn/start 之前）时才退回 agent 视角。
+        const cached = catalogFor(exec?.agent?.session?.id)
+        const schemas = Array.isArray(cached) ? cached : ctx.tools.schemas(exec?.agent)
+        // 20261024-unlockbudget: one cost table, shared with tool-bootstrap through
+        // schemaChars(), so discovery and assembly budget the same family the same way.
+        const sizeOf = schemaSizer(schemas)
+
+        // Resolve unlock names against the REAL catalog before reporting:
+        // exact names, trailing-* patterns and bare MCP server names expand to
+        // concrete tools; anything that matches nothing is reported as missing
+        // instead of a false "Unlocked for the next request".
+        if (unlock.length > 0) {
+          const catalogNames = schemas.map(schema => schema.name)
+          // 自动解析发生在 resolveToolNames 内部（共享给装配层），
+          // 所以这里报出的解锁结果与 tool-bootstrap 实际装配的必然是同一份。
+          const { resolved, missing, autoResolved, deferred, budget } = resolveToolNames(unlock, catalogNames, { sizeOf })
+          if (resolved.length > 0) {
+            lines.push(`Unlocked for the next request: ${displayNames(resolved)}`)
+          }
+          for (const item of deferred) {
+            // 20261024-unlockbudget: never unlock a whole family silently at any
+            // price. Report the real cost and the way forward in the same call.
+            lines.push(
+              `Deferred ${displayText(item.from, RESULT_NAME_LIMIT)}: ${item.tools} tools ≈ ${formatChars(item.chars)} chars (≈ ${formatChars(Math.round(item.chars / 4))} tokens) would join EVERY later request; over this call's unlock budget (${budget.maxTools} tools / ${formatChars(budget.maxChars)} chars). Nothing from it was unlocked — search it, then ask for exact names: dev_tool_search({"query": "<keyword>"}).`,
+            )
+            const members = displayNames(item.names.slice(0, 8))
+            if (members.length > 0) lines.push(`  members: ${members}`)
+          }
+          for (const note of bundleNotes) lines.push(`Bundle expanded: ${note}`)
+          for (const auto of autoResolved) {
+            lines.push(`Auto-resolved ${displayText(auto.from, RESULT_NAME_LIMIT)} → ${auto.to}（${auto.reason}）；若这不是你要的，请改用精确名重试。`)
+          }
+          if (missing.length > 0) {
+            lines.push(`No tools match: ${displayNames(missing)}`)
+            // Same-call correction: surface the closest real names so the next
+            // attempt is right instead of another blind round.
+            let suggestions = 0
+            for (const name of missing) {
+              if (suggestions >= 3) break
+              const hint = suggestNames(name, catalogNames)
+              const shown = displayText(name, RESULT_NAME_LIMIT)
+              const server = displayText(name.split('__')[1], 64)
+              if (hint.kind === 'names' && hint.family.length > 0) {
+                lines.push(`  closest to ${shown}: ${displayNames(hint.family)}`)
+                suggestions += 1
+              } else if (hint.kind === 'family') {
+                lines.push(`  ${shown}: the ${server} family exists but no member shares those words; page the catalog with query "${server}".`)
+                suggestions += 1
+              } else if (hint.kind === 'server-down') {
+                lines.push(`  ${shown}: no ${server} tools are in the catalog — the MCP server may still be connecting or be disabled; retry once later or search query "${server}".`)
+                suggestions += 1
+              }
+            }
+          }
+        }
+
+        if (query.length > 0) {
+          if (query.length > MAX_QUERY_LENGTH) {
+            lines.push(`Invalid query: keep it within ${MAX_QUERY_LENGTH} characters (received ${query.length}).`)
+            return { text: budgetText(lines) }
+          }
+          const offset = args.offset === undefined ? 0 : args.offset
+          const limit = args.limit === undefined ? DEFAULT_LIMIT : args.limit
+          if (!Number.isSafeInteger(offset) || offset < 0) {
+            lines.push('Invalid offset: use a non-negative safe integer (default 0).')
+            return { text: budgetText(lines) }
+          }
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+            lines.push(`Invalid limit: use an integer from 1 to ${MAX_LIMIT} (default ${DEFAULT_LIMIT}).`)
+            return { text: budgetText(lines) }
+          }
+          const groups = expandTokenGroups(tokenize(query))
+          if (groups.length === 0) {
+            // An all-separator query (pure punctuation) must not vacuously
+            // match everything — the pre-fix behavior returned the whole
+            // catalog for any Chinese query via exactly this path.
+            lines.push(`No usable search tokens in "${query}".`)
+            return { text: budgetText(lines) }
+          }
+          // 20261017-audit-p1: a single ASCII letter matches almost every
+          // description ("e" returned 90 tools in October). Reject it instead
+          // of spending a round; a single CJK character is still allowed.
+          if (/^[a-z0-9]$/i.test(query.trim())) {
+            lines.push(`Invalid query: "${query}" is too short — use at least 2 characters or a tool-name keyword.`)
+            return { text: budgetText(lines) }
+          }
+          const haystackOf = (schema) => `${schema.name} ${searchSummary(schema)}`.toLowerCase()
+          // 排除本工具自身：它的描述里为了做能力索引，几乎列全了所有关键词，
+          // 于是任何查询都会把它自己排进前列，实测污染了大部分未命中查询的 top-3。
+          const searchable = schemas.filter((schema) => schema.name !== 'dev_tool_search')
+          const rank = (list) =>
+            list
+              .map((schema) => ({ schema, score: relevanceOf(schema, groups) }))
+              .sort((a, b) => b.score - a.score || 0) // Array#sort 稳定：同分保持目录序
+              .map((entry) => entry.schema)
+          // 分级放宽（20260930-recall）：原来只有"每个词都要命中"一档，一个字
+          // 没中就整条归零（实测 33 条真实问法里 5 条零结果）。现在按
+          // 严格 AND → 命中任一（按命中词数排序）→ 名称相似度 依次退让，
+          // 并在输出里说明退到了哪一档，模型才知道结果为什么是宽的。
+          let relaxNote = ''
+          let allMatches = rank(searchable.filter((schema) => groups.every((group) => group.some((candidate) => haystackOf(schema).includes(candidate)))))
+          if (allMatches.length === 0) {
+            const partial = searchable
+              .map((schema) => ({ schema, hit: groups.filter((group) => group.some((candidate) => haystackOf(schema).includes(candidate))).length }))
+              .filter((entry) => entry.hit > 0)
+              .sort((a, b) => b.hit - a.hit || relevanceOf(b.schema, groups) - relevanceOf(a.schema, groups))
+            if (partial.length > 0) {
+              allMatches = partial.map((entry) => entry.schema)
+              relaxNote = `严格匹配无结果，已放宽为"命中任一关键词"（最佳命中 ${partial[0].hit}/${groups.length} 个词）。`
+            } else {
+              const grams = cjkGramMatch(searchable, groups, haystackOf)
+              if (grams.length > 0) {
+                allMatches = grams
+                relaxNote = '没有整词命中；以下按中文子串（2-gram）命中数给出，命中越多排越前。'
+              } else {
+                const fuzzy = fuzzyByName(searchable, groups)
+                if (fuzzy.length > 0) {
+                  allMatches = fuzzy
+                  relaxNote = '没有关键词命中，以下按名称相似度给出最接近的工具。'
+                }
+              }
+            }
+          }
+          // 20261017-audit-p1: the relaxed branch used to return up to 144
+          // tools, most of them irrelevant, and the 3,800-char page budget then
+          // truncated the body. Keep the best 12 and let the model narrow the
+          // query instead of paging through noise.
+          if (relaxNote !== '' && allMatches.length > RELAXED_MATCH_LIMIT) {
+            const total = allMatches.length
+            allMatches = allMatches.slice(0, RELAXED_MATCH_LIMIT)
+            relaxNote += ` 仅显示相关度最高的 ${RELAXED_MATCH_LIMIT} 个（共 ${total} 个命中）；补关键词可缩小范围。`
+          }
+          const candidates = allMatches.slice(offset, offset + limit)
+          if (allMatches.length === 0) {
+            lines.push(`No search results for "${query}".`)
+          } else if (candidates.length === 0) {
+            lines.push(`No tools at offset ${offset} for "${query}" (${allMatches.length} total matches).`)
+          } else {
+            // A long same-call unlock report must never push the first page body
+            // (especially its continuation line) past the rendering budget: drop
+            // the optional closest-name suggestions first, keeping the unlock
+            // status, the missing-name report and every result row intact.
+            while (
+              lines.length > 1 &&
+              lines[lines.length - 1].startsWith('  ') &&
+              lines.join('\n').length + PAGE_FURNITURE_RESERVE > RESULT_TEXT_BUDGET
+            ) {
+              lines.pop()
+            }
+            const prefix = lines.join('\n')
+            const pageRows = []
+            const renderPage = (rows) => {
+              const nextOffset = offset + rows.length
+              const pageLines = [
+                `Matching tools (${allMatches.length}, showing ${offset + 1}-${nextOffset}):`,
+                ...rows,
+              ]
+              if (relaxNote !== '') pageLines.push(`Note: ${relaxNote}`)
+              if (unlock.length === 0) {
+                pageLines.push('Unlock with dev_tool_search({"toolNames": ["<exact name or group>"]}).')
+              }
+              if (nextOffset < allMatches.length) {
+                pageLines.push(`Next page: dev_tool_search(${JSON.stringify({ query, offset: nextOffset, limit })}).`)
+              }
+              return pageLines
+            }
+            const pageTextLength = rows => {
+              const page = renderPage(rows).join('\n')
+              return prefix.length + (prefix.length > 0 ? 1 : 0) + page.length
+            }
+            for (const schema of candidates) {
+              const desc = (schema.description || '').split('\n')[0].slice(0, RESULT_DESCRIPTION_LIMIT)
+              const cost = sizeOf(schema.name)
+              const costNote = cost >= 8000 ? ` [≈${formatChars(cost)} chars/request]` : ''
+              const row = `- ${displayText(schema.name, RESULT_NAME_LIMIT)}: ${desc}${costNote}`
+              const proposed = [...pageRows, row]
+              if (pageRows.length > 0 && pageTextLength(proposed) > RESULT_TEXT_BUDGET) break
+              pageRows.push(row)
+            }
+            lines.push(...renderPage(pageRows))
+          }
+        }
+      } catch (error) {
+        lines.push(`catalog search unavailable: ${String((error && error.message) || error)}`)
+      }
+      return { text: budgetText(lines) }
+    },
+  })
+}
