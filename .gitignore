@@ -1,0 +1,6 @@
+*.bak
+*.bak-*
+.maintenance/
+research-*/
+_archive-*/
+node_modules/

@@ -1,0 +1,15 @@
+{
+  "name": "@local/dsh-agent-preset-lean",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "ELECTRON_RUN_AS_NODE=1 DSH_TEST_RUNTIME_ROOT='/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh' '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness' --expose-internals --test tests/*.test.mjs"
+  },
+  "description": "Lean preset (0.1.7 agent-preset declaration) migrated from the legacy .agent-presets directory format.",
+  "dsh": {
+    "bundle": {
+      "patch": "./lean.patch.yml"
+    }
+  }
+}
