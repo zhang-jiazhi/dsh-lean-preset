@@ -9,6 +9,7 @@ DeepSeek Harness (DSH) 的 **Lean 预设**：核心规则与专项目录自动�
 - DeepSeek Harness **0.1.7+**（本预设使用 `@deepseek-ai/dsh-agent-preset` 声明格式）
 - 30+ 个官方插件包，均为 `@deepseek-ai/dsh-*`，由 DSH 本体提供，无需单独安装
 - 可选的 MCP 工具：`@playwright/mcp`、`github-mcp-server`、`rea-agent`、`uvx` 等
+- `plugins/dsh-lean-batch` 的 peerDependencies：`@deepseek-ai/cordis >=4.0.0-rc`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-ptc-runtime`（均由 DSH 本体提供）
 
 ## 安装
 
@@ -23,8 +24,18 @@ DeepSeek Harness (DSH) 的 **Lean 预设**：核心规则与专项目录自动�
    `rea-agent`、`node`、`PATH`、缓存目录等）。若这些 MCP 工具你不使用，可整段删除，
    不影响预设的核心行为。
 
-3. 通过 pluginManager 的 `setBundleEnabled('@local/dsh-agent-preset-lean', true)` 激活补丁
-4. `package.json` 的 `test` 脚本内含 macOS 应用路径，按你的安装位置调整
+3. 安装配套插件 `plugins/dsh-lean-batch`：
+
+   ```bash
+   cp -r plugins/dsh-lean-batch ~/.dsh/local-plugins/
+   ```
+
+   它提供工具索引里的 `batch` 工具（模型写一段程序，程序内经 `ctx.tools.execute()`
+   调用本会话可见工具，中间结果不进对话）。不装它的话，`tool_gateway` 索引里的
+   `batch` 会是死条目。
+
+4. 通过 pluginManager 的 `setBundleEnabled('@local/dsh-agent-preset-lean', true)` 激活补丁
+5. `package.json` 的 `test` 脚本内含 macOS 应用路径，按你的安装位置调整
 
 ## 目录说明
 
@@ -42,6 +53,7 @@ DeepSeek Harness (DSH) 的 **Lean 预设**：核心规则与专项目录自动�
 | `compaction-*.mjs` | 压缩阈值、epoch 与 refill 保护 |
 | `custom-bash.mjs`、`shell-*.mjs` | bash 工具定制与输出规范化 |
 | `instruction-hint.mjs`、`todo-anchor.mjs` | 提示与 todo 锚定 |
+| `plugins/dsh-lean-batch/` | 配套插件：提供工具索引里的 `batch` 工具（见下） |
 
 ## 工具曝光策略
 

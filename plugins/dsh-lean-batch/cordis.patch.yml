@@ -1,0 +1,9 @@
+# @local/dsh-lean-batch — LEAN 预设的可选 batch 工具。
+#
+# 宿主半：注册一个 `batch` 模型工具——模型写一段程序，程序内经
+# ctx.tools.execute() 调用本会话可见工具并把中间结果聚合在程序里，只有
+# 程序输出回到对话。执行委托给 ctx.ptcRuntime（沙箱/预算/输出上限都是
+# 运行时自己的）。无客户端半。
+- insert:
+    - id: lean-batch
+      name: '@local/dsh-lean-batch'
