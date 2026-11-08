@@ -346,7 +346,7 @@ const GATEWAY_ACTIONS = new Set(['search', 'describe', 'call', 'list'])
 /**
  * Team tools are gated by session arming, not by the gateway catalog. Naming
  * them as "not gateway tools" without that condition sent a real Team Lead
- * session (2026-10-31, session-example-b) into a dead end: the tools were absent
+ * session (2026-10-31, session-example) into a dead end: the tools were absent
  * from its catalog, the model tried `tool_gateway call list_agents`, and the
  * generic message told it "if it is visible, call it directly".
  */
@@ -370,6 +370,30 @@ const ORDINARY_WAIT_HINT = 'For ordinary subagent results, continue useful work 
 const directToolText = (toolName) => (TEAM_TOOLS.has(toolName)
   ? `"${toolName}" is a Team tool, not a gateway tool. Team tools are listed only when this session is a Team session; if it is not in your tool list right now, it is unavailable. Do not bypass that through the gateway.${toolName === 'wait_agent' || toolName === 'send_message' ? ' ' + ORDINARY_WAIT_HINT : ''}`
   : `"${toolName}" is not gateway-eligible. If it is visible in your tool list, call it directly; otherwise it is unavailable.`)
+
+/** Argument keys the gateway accepts; anything else is a malformed call. */
+const GATEWAY_ARG_KEYS = new Set(['action', 'name', 'input', 'calls', 'query', 'offset'])
+
+/** Common keys the model emits when it translates this schema into Chinese. */
+const ARG_ALIASES = new Map([
+  ['操作', 'action'], ['动作', 'action'], ['行为', 'action'],
+  ['名称', 'name'], ['工具', 'name'], ['工具名', 'name'], ['工具名称', 'name'],
+  ['输入', 'input'], ['参数', 'input'], ['入参', 'input'],
+  ['调用', 'calls'], ['查询', 'query'], ['偏移', 'offset'],
+])
+
+/**
+ * Explain a malformed argument object instead of failing on its first key.
+ * Full-width quotes (`“操作”`) never reach here — the host rejects the JSON
+ * before any tool runs — so this only covers the parseable variant.
+ */
+const malformedArgumentsText = (args, unknown) => {
+  const mapped = unknown.map(key => (ARG_ALIASES.has(key) ? `${key} → ${ARG_ALIASES.get(key)}` : key))
+  const sample = JSON.stringify({ action: 'call', name: '<tool>', input: {} })
+  return `unrecognized argument key(s): ${mapped.join(', ')}. `
+    + `tool_gateway accepts only action / name / input / calls / query / offset, spelled in ASCII `
+    + `(JSON strings use straight double quotes, not “ ”). Retry with e.g. ${sample}.`
+}
 
 const actionNameText = (toolName) => `"${toolName}" is a gateway action, not a tool name. Use action="${toolName}"${toolName === 'search' ? ' with a query' : toolName === 'call' ? ' with name and input' : ''} instead of passing it as name.`
 
@@ -462,6 +486,14 @@ const definition = (ctx) => ({
     ),
   },
   async execute(args, exec) {
+    // A long Chinese session can make the model translate the schema itself:
+    // keys arrive as 操作/名称/输入 (and, before parsing, full-width quotes).
+    // The bare "Unknown action" it used to get was unactionable; name the
+    // contract instead so one retry fixes it.
+    if (args !== null && typeof args === 'object' && !Array.isArray(args)) {
+      const unknown = Object.keys(args).filter(key => !GATEWAY_ARG_KEYS.has(key))
+      if (unknown.length > 0) throw new Error(malformedArgumentsText(args, unknown))
+    }
     const action = args?.action ?? (Array.isArray(args?.calls) ? 'call' : undefined)
     if (Array.isArray(args?.calls) && action !== 'call') {
       throw new Error('calls only applies to action="call".')
@@ -511,7 +543,7 @@ const definition = (ctx) => ({
     // A hidden tool's schema is invisible until `describe`, so a wrong field
     // name only surfaces as the executor's generic rejection. Naming every
     // missing property in one message turns the guess-and-retry loop into one
-    // round: measured in session-example-b, where `update_goal` cost two failed
+    // round: measured in session-example, where `update_goal` cost two failed
     // calls (`id`/`phase`, then `expected_revision`) before the third succeeded.
     const schema = definitions.get(toolName)?.parameters
     const missing = missingRequiredProperties(schema, input)

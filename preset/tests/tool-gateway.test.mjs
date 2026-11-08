@@ -171,6 +171,30 @@ test('mixed resident and gated Team searches keep the two routing claims separat
   assert.doesNotMatch(hit.text, /wait_agent (?:is|are) already visible/)
 })
 
+test('Chinese argument keys get a corrective hint instead of "Unknown action"', async () => {
+  const f = fixture()
+  const error = await f.tool.execute(
+    { 操作: '调用', 名称: 'job_output', 输入: { job_id: 'bash-1' } },
+    { agent: {}, signal: new AbortController().signal },
+  ).then(() => null, (raised) => raised)
+  assert.ok(error, 'malformed keys must be rejected')
+  assert.match(error.message, /操作 → action/)
+  assert.match(error.message, /名称 → name/)
+  assert.match(error.message, /输入 → input/)
+  assert.match(error.message, /straight double quotes/)
+  assert.match(error.message, /"action":"call"/)
+  assert.equal(f.executed.length, 0, 'nothing may run for a malformed call')
+})
+
+test('unknown non-Chinese keys are named too, and valid keys stay untouched', async () => {
+  const f = fixture()
+  const raised = await f.tool.execute({ action: 'list', nope: 1 }, { agent: {} }).then(() => null, e => e)
+  assert.ok(raised)
+  assert.match(raised.message, /nope/)
+  const ok = await f.tool.execute({ action: 'list', offset: 0 }, { agent: {} })
+  assert.match(ok.text, /gateway tools/)
+})
+
 test('call delegates through tools.execute with a private tool set', async () => {
   const f = fixture()
   const agent = { id: 'a' }
@@ -442,7 +466,7 @@ test('a call missing required schema properties names all of them at once', asyn
     },
   })
 
-  // Exactly the session-example-b shape: `id`/`phase` instead of goal_id/action/revision.
+  // Exactly the session-example shape: `id`/`phase` instead of goal_id/action/revision.
   await assert.rejects(
     () => registered.execute({ action: 'call', name: 'update_goal', input: { id: 'goal-1', revision: 1, phase: 'complete' } }, { agent: {} }),
     /invalid arguments for "update_goal": missing required "goal_id", "action"\. Required: goal_id, action, revision\. Call action="describe" with name="update_goal"/,
