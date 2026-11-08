@@ -206,10 +206,25 @@ if (runRules) checkRules(known)
 // 20261103-lean-opt：宿主 Config 键对比。schemastery 非严格，未知键被静默丢弃
 // （A1 的 modelSelectionSettings 就是这样消失的）。需要 schema 缓存；缺失时只记
 // info，不阻塞 CI。生成方式见 lean-config-keys.mjs 文件头。
+// 20261106：schema 结构不可信 / 零覆盖 / 部分覆盖都不算通过，必须显式告警。
 const configKeys = runPreset ? checkConfigKeys({ patchPath: PATCH }) : undefined
-if (configKeys !== undefined && configKeys.status === 'unknown-keys') {
-  for (const row of configKeys.unknown) {
-    warn(`配置键：${row.id} (${row.name}) 传了宿主不接受的键 ${row.keys.join(', ')}；宿主接受 ${row.accepted.join(', ')}`)
+if (configKeys !== undefined) {
+  const keyPathsOf = (row) => (Array.isArray(row.paths) && row.paths.length > 0 ? row.paths : row.keys ?? [])
+  // unknown 与 missing 可能同时存在（status 只取优先级最高的那个），两个列表都要报。
+  for (const row of configKeys.unknown ?? []) {
+    warn(`配置键：${row.id} (${row.name}) 传了宿主不接受的键 ${keyPathsOf(row).join(', ')}${row.accepted.length > 0 ? `；宿主接受 ${row.accepted.join(', ')}` : ''}`)
+  }
+  for (const row of configKeys.missing ?? []) {
+    warn(`配置键：${row.id} (${row.name}) 缺少 schema required 的必填键 ${keyPathsOf(row).join(', ')}`)
+  }
+  if (configKeys.status === 'no-coverage') {
+    warn(`配置键：零覆盖——${configKeys.configRows} 个带对象 config 的插件行一行都没完成校验，不能当通过（schema 条目 ${configKeys.schemaEntries}）`)
+  }
+  if (configKeys.status === 'partial') {
+    warn(`配置键：部分覆盖 ${configKeys.checked}/${configKeys.configRows}（不是完整验收），${configKeys.uncheckedCount} 行无可用 schema；未发现 unknown/missing。schema 自报 complete=${configKeys.schema?.complete === true}`)
+  }
+  if (configKeys.status === 'schema-invalid') {
+    warn(`配置键：schema 缓存结构不可信（${(configKeys.problems ?? []).join('；') || configKeys.message}），本次结果不能作为通过依据`)
   }
 }
 
@@ -221,8 +236,19 @@ if (mode) {
   if (runSkills) console.log(`lean-check: 扫描技能 ${scanned} 个`)
   if (runPreset) console.log(`lean-check: 预设 id 行 ${preset?.ids ?? 0} 个（含 group）、本地引用 ${preset?.refs ?? 0} 个`)
   if (configKeys !== undefined) {
-    if (configKeys.status === 'ok') console.log(`lean-check: 配置键对比通过（${configKeys.checked}/${configKeys.rows} 行，schema 条目 ${configKeys.schemaEntries}）`)
-    else if (configKeys.status === 'unknown-keys') console.log(`lean-check: 配置键对比发现 ${configKeys.unknown.length} 行未知键（见 WARN）`)
+    if (configKeys.schema?.sha256) {
+      const local = configKeys.localPlugins?.rows > 0 ? `；本地插件 ${configKeys.localPlugins.rows} 行按本地契约跳过` : ''
+      console.log(`lean-check: schema 指纹 ${configKeys.hostVersion || '宿主版本未知'} / sha256:${String(configKeys.schema.sha256).slice(0, 12)}… / ${configKeys.schema.mtime ?? 'mtime 未知'}${local}`)
+    }
+    if (configKeys.status === 'ok') console.log(`lean-check: 配置键对比通过（${configKeys.checked}/${configKeys.configRows} 行，schema 条目 ${configKeys.schemaEntries}）`)
+    else if (configKeys.status === 'unknown-keys') {
+      const missingCount = configKeys.missing?.length ?? 0
+      console.log(`lean-check: 配置键对比发现 ${configKeys.unknown.length} 行未知键${missingCount > 0 ? `、${missingCount} 行缺必填键` : ''}（见 WARN）`)
+    }
+    else if (configKeys.status === 'missing-keys') console.log(`lean-check: 配置键对比发现 ${configKeys.missing.length} 行缺必填键（见 WARN）`)
+    else if (configKeys.status === 'partial') console.log(`lean-check: 配置键对比部分覆盖 ${configKeys.checked}/${configKeys.configRows}（不是完整验收，见 WARN）`)
+    else if (configKeys.status === 'no-coverage') console.log(`lean-check: 配置键对比零覆盖（${configKeys.configRows} 行 config 一行未校验，见 WARN）`)
+    else if (configKeys.status === 'schema-invalid') console.log('lean-check: 配置键对比不可信（schema-invalid，见 WARN）')
     else console.log(`lean-check: 配置键对比跳过（${configKeys.status}）`)
   }
   if (runSkills) console.log('提示：工具名检查只对已知死名单报 error；其他未知名用 --verbose 人工巡检')

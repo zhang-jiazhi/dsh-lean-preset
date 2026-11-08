@@ -133,8 +133,11 @@ const editHintFor = (result) => {
   return FILE_EDIT_HINTS.find(([pattern]) => pattern.test(text))?.[1]
 }
 
-const BASH_TTY_HINT = 'Hint: this command needs an interactive TTY/stdin. Plain bash cannot answer prompts; unlock terminal_* with dev_tool_search({toolNames:["terminal"]}) instead of retrying bash.'
-const BASH_TIMEOUT_HINT = 'Hint: for long-running work use bash run_in_background + job_output; if it needs interaction, unlock terminal_* instead.'
+// LEAN has no `dev_tool_search` in its catalog: the only on-demand entry is
+// `tool_gateway`. A hint that names an unmounted tool sends the model to a dead
+// end, so both alternatives below use the gateway's actual search/call flow.
+const BASH_TTY_HINT = 'Hint: this command needs an interactive TTY/stdin. Plain bash cannot answer prompts; use tool_gateway action="search" query="terminal", then action="call" with the terminal_* tool instead of retrying bash.'
+const BASH_TIMEOUT_HINT = 'Hint: for long-running work use bash run_in_background, then collect with tool_gateway action="call" name="job_output" (job_list/job_kill); if it needs interaction, call the terminal_* tool through tool_gateway.'
 
 const bashHintFor = (result) => {
   if (result?.isError !== true && result?.error === undefined) return undefined

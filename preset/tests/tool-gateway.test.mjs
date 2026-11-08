@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { apply as gateway } from '../tool-gateway.mjs'
-import { markGatewayEligible } from '../gateway-policy.mjs?release=20261029-gateway3'
+import { markGatewayEligible } from '../gateway-policy.mjs?release=20261106-fixes'
 
 const fixture = () => {
   let tool
@@ -84,7 +84,12 @@ test('gateway exposes a fixed schema and lists hidden tools', async () => {
   // searching families the gateway can never serve.
   assert.match(f.tool.description, /NOT gateway tools/)
   assert.match(f.tool.description, /list_agents\/send_message\/spawn_teammate/)
-  assert.match(f.tool.description, /subagent\/workflow; goal\/job/)
+  // Routing matches the live catalog: workflow/goal/job families live behind
+  // the gateway; subagent is resident at top level and gateway-reachable in a
+  // child. The old text claimed the opposite and sent the model to a dead end.
+  assert.doesNotMatch(f.tool.description, /subagent\/workflow; goal\/job/)
+  assert.match(f.tool.description, /workflow_\*; goal tools .*jobs \(job_list\/job_output\/job_kill\)/)
+  assert.match(f.tool.description, /`subagent` is resident at top level, `subagent_fork` is gateway-only there, and both are gateway-reachable from a delegation child/)
   assert.ok(f.tool.description.indexOf('NOT gateway tools') < f.tool.description.indexOf('Family index'))
   assert.match(f.tool.description, /Family index/)
   assert.match(f.tool.description, /playwright/)
@@ -113,12 +118,57 @@ test('a search for directly visible tools names them instead of dead-ending', as
   assert.match(hit.text, /No gateway-eligible tools match/)
   assert.match(hit.text, /list_agents/)
   assert.match(hit.text, /team_task_list/)
-  assert.match(hit.text, /already visible in your tool list — call them directly/)
+  assert.match(hit.text, /Team tools are listed only when/)
+  assert.doesNotMatch(hit.text, /already visible in your tool list/)
   assert.doesNotMatch(hit.text, /Try list/)
   assert.doesNotMatch(hit.text, /hidden_read/)
 
   const miss = await f.tool.execute({ action: 'search', query: 'quux_zzz' }, { agent: {} })
   assert.equal(miss.text, 'No gateway-eligible tools match "quux_zzz". Try list.')
+})
+
+test('searching absent Team wait tools explains ordinary result delivery without inventing visibility', async () => {
+  const f = fixture()
+  const delegate = { name: 'hidden_delegate', description: 'Child reports results with send_message.' }
+  f.definitions.set(delegate.name, delegate)
+  markGatewayEligible(delegate)
+  for (const name of ['wait_agent', 'send_message']) {
+    const hit = await f.tool.execute({ action: 'search', query: name }, { agent: {} })
+    assert.match(hit.text, /Team tool/)
+    assert.match(hit.text, /end your turn/)
+    assert.match(hit.text, /subagent id as a job id/)
+    assert.doesNotMatch(hit.text, /already visible|Try list/)
+    assert.doesNotMatch(hit.text, /hidden_delegate/)
+  }
+})
+
+test('observed ordinary waiting phrases recover without recommending polling tools', async () => {
+  const f = fixture()
+  for (const query of ['wait agent', 'wait_agent send_message', 'subagent wait result status']) {
+    const hit = await f.tool.execute({ action: 'search', query }, { agent: {} })
+    assert.match(hit.text, /end your turn/)
+    assert.match(hit.text, /subagent id as a job id/)
+    assert.doesNotMatch(hit.text, /Try list/)
+  }
+})
+
+test('a real named wait capability is not hidden by ordinary waiting recovery', async () => {
+  const f = fixture()
+  const definition = { name: 'subagent_wait_result_status', description: 'An optional explicit status capability.' }
+  f.definitions.set(definition.name, definition)
+  markGatewayEligible(definition)
+  const hit = await f.tool.execute({ action: 'search', query: 'subagent wait result status' }, { agent: {} })
+  assert.match(hit.text, /subagent_wait_result_status/)
+  assert.doesNotMatch(hit.text, /end your turn/)
+})
+
+test('mixed resident and gated Team searches keep the two routing claims separate', async () => {
+  const f = fixture()
+  f.definitions.set('bash', { name: 'bash', description: 'Run commands.' })
+  const hit = await f.tool.execute({ action: 'search', query: 'bash, wait_agent' }, { agent: {} })
+  assert.match(hit.text, /bash is already visible/)
+  assert.match(hit.text, /"wait_agent" is a Team tool/)
+  assert.doesNotMatch(hit.text, /wait_agent (?:is|are) already visible/)
 })
 
 test('call delegates through tools.execute with a private tool set', async () => {
@@ -392,7 +442,7 @@ test('a call missing required schema properties names all of them at once', asyn
     },
   })
 
-  // Exactly the session-example-a shape: `id`/`phase` instead of goal_id/action/revision.
+  // Exactly the session-example-b shape: `id`/`phase` instead of goal_id/action/revision.
   await assert.rejects(
     () => registered.execute({ action: 'call', name: 'update_goal', input: { id: 'goal-1', revision: 1, phase: 'complete' } }, { agent: {} }),
     /invalid arguments for "update_goal": missing required "goal_id", "action"\. Required: goal_id, action, revision\. Call action="describe" with name="update_goal"/,

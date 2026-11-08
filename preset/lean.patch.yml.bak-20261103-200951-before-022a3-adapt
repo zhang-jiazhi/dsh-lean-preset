@@ -101,7 +101,7 @@
             name: '@local/dsh-agent-preset-lean/tool-bootstrap-entry-20261101-guard2.mjs'
             config:
               # 20261031-toolhints2：edit/write 的 schema 描述尾部追加读证据约束
-              #   （“edit 需要先 read；bash 写入会作废证据”）。真实会话 session-example-a
+              #   （“edit 需要先 read；bash 写入会作废证据”）。真实会话 session-example-b
               #   里 70% 的文件改动走 bash（29 次 python heredoc vs 13 次 edit/write），
               #   并因此产生 1 次 file changed since it was read；AGENTS 规则在第 200 步
               #   时已远离上下文，而 schema 每步都在。read 的同类提示做过 N=10×2 A/B：
@@ -109,7 +109,7 @@
               #   edit+write 只影响晋升后的目录，裁剪后 +217 字符。
               # 20261031-teamlead：Team 布防新增一条来源——Team 插件在会话开始时
               #   注入的 runtime-context 快照（"You are the Team Lead named …"）。
-              #   实测（session-example-a，216 步）：快照让模型去用 list_agents，但首条
+              #   实测（session-example-b，216 步）：快照让模型去用 list_agents，但首条
               #   用户消息只是两个文件路径，Team 未布防 → 目录里没有团队工具，模型花
               #   一轮调 gateway 拿 "not gateway-eligible"。这条标记是团队插件自己声明
               #   "本会话就是 Team"，因此从第 1 个请求起布防；普通 runtime 提醒不会命中。
@@ -241,7 +241,7 @@
           # search 零命中且查询命中“已直接可见”的工具名时，直接点名让模型改用直呼，
           # 不再给死胡同。描述 1446→1380 字符（-66），action 参数描述逐字未变，
           # ALWAYS SEARCH FIRST 原句保留。换入口 + release URL 绕 ESM 缓存。
-          # 20261031-deadend3：两条来自真实会话 session-example-a 的死胡同修正——
+          # 20261031-deadend3：两条来自真实会话 session-example-b 的死胡同修正——
           #   1) Team 工具在“本回合没列出”时，报 Team-gated 而不是泛泛的 not eligible
           #      （那轮模型被告知去用 list_agents，目录里却没有，只能白试一轮 gateway）；
           #   2) 把 action 当 name 传（name:"search"）时给纠正提示，而不是 Unknown tool。
@@ -618,7 +618,7 @@
                   maxTokens: 65536
                   retainRatio: 0.16
                   # ── 摘要模型固定（2026-10-02）──────────────────────────────────
-                  # 现象：会话 session-example-b「无法压缩、无法对话」——每个 turn 的
+                  # 现象：会话 session-example-c「无法压缩、无法对话」——每个 turn 的
                   # pre-step 压力压缩先跑 2 次摘要（compactionRetries 默认 1），两次都
                   # 失败，单步阻塞约 5–10 分钟；手动 /compact 同样以摘要失败收场。
                   # 根因（实测，非推断）：摘要默认跟随"最近一次已路由请求"的

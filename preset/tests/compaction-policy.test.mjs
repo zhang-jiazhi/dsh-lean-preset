@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { readFile } from 'node:fs/promises'
-import { runtimeRequire as require } from './runtime-helper.mjs'
+import { runtime, runtimeRequire as require } from './runtime-helper.mjs'
 import { apply, policyFor } from '../compaction-absolute-threshold.mjs'
 
 const { entryListSchema } = require('@deepseek-ai/cordis-plugin-include')
@@ -151,6 +151,151 @@ test('the same route is resolved once, and a new route is retuned', async () => 
   assert.equal(lookups, 1, 'the window is a property of the route, not of the step')
 })
 
+test('an existing route policy keeps its summarization route and its lower trigger', async () => {
+  const f = fixture()
+  const original = {
+    provider: 'relay-cn',
+    model: 'deepseek-v4.1-flash',
+    thresholdRatio: 0.2,
+    summarizationProvider: 'cheap',
+    summarizationModel: 'summary',
+  }
+  f.engine.config.modelPolicies = [original]
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  // The route already fires at 200k, below the 400k budget: "only lower" means
+  // it must stay untouched, summarization route included.
+  assert.deepEqual(f.engine.config.modelPolicies, [original])
+})
+
+test('lowering an existing route merges the policy instead of replacing it', async () => {
+  const f = fixture()
+  f.engine.config.modelPolicies = [{
+    provider: 'relay-cn',
+    model: 'deepseek-v4.1-flash',
+    thresholdRatio: 0.9,
+    headroomTokens: 10_000,
+    retainRatio: 0.16,
+    summarizationProvider: 'cheap',
+    summarizationModel: 'summary',
+  }]
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  const policy = f.engine.config.modelPolicies[0]
+  assert.equal(policy.thresholdRatio, 0.4)
+  assert.equal(policy.retainTokens, 80_000)
+  assert.equal(policy.retainRatio, undefined, 'the engine rejects both retention forms')
+  assert.equal(policy.summarizationProvider, 'cheap')
+  assert.equal(policy.summarizationModel, 'summary')
+  assert.equal(policy.headroomTokens, 10_000)
+})
+
+test('an external summarization change survives the "no longer needs tuning" revert', async () => {
+  const f = fixture()
+  f.engine.config.modelPolicies = [{
+    provider: 'relay-cn',
+    model: 'deepseek-v4.1-flash',
+    thresholdRatio: 0.9,
+    summarizationProvider: 'cheap',
+    summarizationModel: 'summary-v1',
+  }]
+  let reserved = 0
+  f.agent.session.requestHeader = () => ({
+    config: { provider: 'relay-cn', model: 'deepseek-v4.1-flash', maxTokens: reserved },
+  })
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  assert.equal(f.engine.config.modelPolicies[0].thresholdRatio, 0.4)
+
+  // An external owner changes the summarization route while the plugin is
+  // active. The revert must undo OUR fields only.
+  f.engine.config.modelPolicies[0].summarizationModel = 'summary-v2'
+  reserved = 600_000
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  const policy = f.engine.config.modelPolicies[0]
+  assert.equal(policy.summarizationModel, 'summary-v2')
+  assert.equal(policy.thresholdRatio, 0.9)
+  assert.equal(policy.retainTokens, undefined)
+})
+
+test('disposal does not overwrite an external change to a plugin-owned field', async () => {
+  const f = fixture()
+  f.engine.config.modelPolicies = [{
+    provider: 'relay-cn',
+    model: 'deepseek-v4.1-flash',
+    thresholdRatio: 0.9,
+    summarizationProvider: 'cheap',
+    summarizationModel: 'summary-v3',
+  }]
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  f.engine.config.modelPolicies[0].thresholdRatio = 0.5
+  f.engine.config.modelPolicies[0].summarizationModel = 'summary-v4'
+  f.effects[0]()
+  const policy = f.engine.config.modelPolicies[0]
+  assert.equal(policy.thresholdRatio, 0.5, 'the external threshold is not overwritten')
+  assert.equal(policy.summarizationModel, 'summary-v4')
+  assert.equal(policy.retainTokens, undefined, 'the retention field is still owned and is removed')
+})
+
+test('disposal keeps an external retention change and restores only the owned threshold', async () => {
+  const f = fixture()
+  f.engine.config.modelPolicies = [{
+    provider: 'relay-cn',
+    model: 'deepseek-v4.1-flash',
+    thresholdRatio: 0.9,
+    retainRatio: 0.16,
+  }]
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  f.engine.config.modelPolicies[0].retainTokens = 100_000
+  f.effects[0]()
+  const policy = f.engine.config.modelPolicies[0]
+  assert.equal(policy.retainTokens, 100_000, 'the external retention is preserved')
+  assert.equal(policy.retainRatio, undefined)
+  assert.equal(policy.thresholdRatio, 0.9, 'our threshold is restored')
+})
+
+test('a route that stops needing tuning gets its original policy back; disposal restores it', async () => {
+  const f = fixture()
+  const original = {
+    provider: 'relay-cn',
+    model: 'deepseek-v4.1-flash',
+    thresholdRatio: 0.9,
+    summarizationProvider: 'cheap',
+    summarizationModel: 'summary',
+  }
+  f.engine.config.modelPolicies = [original]
+  let reserved = 0
+  f.agent.session.requestHeader = () => ({
+    config: { provider: 'relay-cn', model: 'deepseek-v4.1-flash', maxTokens: reserved },
+  })
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  assert.equal(f.engine.config.modelPolicies[0].thresholdRatio, 0.4)
+
+  // A larger completion reservation leaves too little room for the budget, so
+  // the plugin must restore the ORIGINAL entry, not delete the route's policy.
+  reserved = 600_000
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  assert.deepEqual(f.engine.config.modelPolicies, [original])
+
+  reserved = 0
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  assert.equal(f.engine.config.modelPolicies[0].thresholdRatio, 0.4)
+  f.effects[0]()
+  assert.deepEqual(f.engine.config.modelPolicies, [original])
+})
+
+test('disposal removes a route policy that the plugin created', async () => {
+  const f = fixture()
+  apply(f.ctx, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  await f.engine.compactIfNeeded(f.agent, 'pressure', undefined)
+  assert.equal(f.engine.config.modelPolicies.length, 1)
+  f.effects[0]()
+  assert.deepEqual(f.engine.config.modelPolicies, [])
+})
+
 test('disposal restores the original method, and a bad config is rejected', async () => {
   const f = fixture()
   const original = f.engine.compactIfNeeded
@@ -237,4 +382,43 @@ test('400k lowers the 1M trigger to exactly 400k and leaves smaller routes alone
   assert.equal(policyFor(OPTIONS_400K, 512_000, 65_536, BASE), undefined)
   // A window that cannot fit the budget plus the tail is refused, not lowered.
   assert.equal(policyFor(OPTIONS_400K, 470_000, 0, BASE), undefined)
+})
+
+test('the preset preserves native ordinary delegation waiting guidance without expanding bootstrap tools', async () => {
+  const patch = yaml.load(await readFile(new URL('../lean.patch.yml', import.meta.url), 'utf8'), { schema: entryListSchema })
+  const flatten = rows => rows.flatMap(row => [row, ...(Array.isArray(row.config) ? flatten(row.config) : [])])
+  const preset = flatten(patch.flatMap(row => row.insert ?? [])).find(row => row.id === 'preset-lean')
+  const config = flatten(preset.config.plugins).find(row => row.id === 'tool-bootstrap').config
+  assert.ok(config.keptSections.includes('tool:subagent'))
+  assert.ok(config.keptSections.includes('tool:subagent_fork'))
+  assert.deepEqual(config.bootstrapTools, ['bash', 'read', 'rule_load', 'tool_gateway', 'read_image'])
+})
+
+test('a native automatic pre-step sees the policy written through the real Cordis service proxy', async () => {
+  const { Context, Service } = await runtime('@deepseek-ai/cordis')
+  const { BasicCompactionEngine } = await runtime('@deepseek-ai/dsh-compaction-basic')
+  const ctx = new Context()
+  class Llm extends Service {
+    constructor(context) { super(context, 'llm') }
+    async resolveModelInfo() { return { context: { contextWindow: 1_000_000 } } }
+  }
+  class Meter extends Service { constructor(context) { super(context, 'tokenMeter') } }
+  class Sessions extends Service { constructor(context) { super(context, 'sessions') } }
+  await ctx.plugin({ name: 'policy-native-dependencies', apply(context) { new Llm(context); new Meter(context); new Sessions(context) } })
+  let raw
+  const observed = []
+  class Engine extends BasicCompactionEngine {
+    constructor(context) { super(context, { thresholdRatio: 0.6, retainRatio: 0.16, modelPolicies: [] }); raw = this }
+    async compactPressure() { observed.push(this.config.modelPolicies); return null }
+  }
+  await ctx.plugin({ name: 'policy-native-engine', inject: ['llm', 'tokenMeter', 'sessions'], apply(context) { new Engine(context) } })
+  const original = raw.compactIfNeeded
+  await ctx.plugin({ name: 'policy-native-absolute', inject: ['compaction', 'llm'], apply }, { thresholdTokens: 400_000, retainTokens: 80_000 })
+  assert.notEqual(ctx.get('compaction'), raw, 'the host returns a service proxy')
+  assert.notEqual(raw.compactIfNeeded, original, 'the wrapper must reach the raw engine used by native listeners')
+  const agent = { session: { requestHeader: () => ({ config: { provider: 'runtime-only', model: 'large', maxTokens: 8192 } }) } }
+  await ctx.waterfall('agent/pre-step', { agent, signal: new AbortController().signal }, async () => {})
+  assert.equal(observed.length, 1)
+  assert.equal(observed[0][0].thresholdRatio, 0.4)
+  assert.equal(observed[0][0].retainTokens, 80_000)
 })

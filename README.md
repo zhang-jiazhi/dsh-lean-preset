@@ -32,7 +32,7 @@ AGENTS.md                    →  ~/.dsh/AGENTS.md
 
 ## 依赖
 
-- DeepSeek Harness **0.1.7+**（本预设使用 `@deepseek-ai/dsh-agent-preset` 声明格式）
+- DeepSeek Harness **0.2.2-alpha.3**（本快照在该版本实机验证；`0.1.7+` 的旧声明格式仍兼容）
 - 30+ 个官方插件 `@deepseek-ai/dsh-*`，由 DSH 本体提供
 - `dsh-lean-batch` 的 peerDependencies：`@deepseek-ai/cordis >=4.0.0-rc`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-ptc-runtime`
 - 可选 MCP 工具：`@playwright/mcp`、`github-mcp-server`、`rea-agent`、`uvx`
@@ -55,9 +55,10 @@ AGENTS.md                    →  ~/.dsh/AGENTS.md
 
 ## 工具曝光策略
 
-- **首轮**：`bash`、`str_replace_editor`、`read`、`rule_load`、`tool_gateway`
+- **首轮**：`bash`、`read`、`rule_load`、`tool_gateway`、`read_image`（`str_replace_editor` 已移出：它晋升后不可达，改为经网关按需取回）
 - 首次工具调用后目录收敛到 `residentTools` 白名单
 - 其余工具（skill / 记忆 / subagent / workflow / goal / 后台任务 / web 搜索 / 压缩 / plan-mode / MCP）仍然全部装配、随时可用，但 schema 不进顶层；模型通过 `tool_gateway` 的 `list/search` 发现、`call` 调用
+- `grep` / `glob` 已移出常驻，需要时经 `tool_gateway` 调用；`apply_patch` 同样只在网关侧
 
 ## 配套插件
 
@@ -79,7 +80,7 @@ AGENTS.md                    →  ~/.dsh/AGENTS.md
 - LaunchAgent 标识 `com.<本机用户名>.dsh-web` 替换为 `com.USER.dsh-web`
 - 本机私有项目名、私有中转与供应商名、内部模型别名、本地会话 ID 全部改为中性占位：
   `cua-server`、`router` / `router-responses` / `router-alt` / `relay-primary` / `relay-cn` /
-  `proxy-api`、`model-a` / `model-b`、`session-example-a…d`
+  `proxy-api`、`model-a` / `model-b`、`session-example-*`
 - **不发布** `cache/lean-config-schema.json`：该文件是宿主 schema 快照，会列出本机安装的
   全部第三方与本地插件，且含本机 profile 名。需要时本地自行生成：
   `dsh --dump-config-schema > ~/.dsh/cache/lean-config-schema.json`

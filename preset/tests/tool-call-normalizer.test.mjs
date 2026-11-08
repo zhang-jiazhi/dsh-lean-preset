@@ -97,8 +97,12 @@ test('bash TTY/timeout failures point at terminal/background alternatives', asyn
   )
   const tty = await run('Error: stdin is not a tty')
   assert.match(tty.content.at(-1).text, /terminal_\*/)
+  // lean has no dev_tool_search; naming it sends the model to an unmounted tool.
+  assert.match(tty.content.at(-1).text, /tool_gateway action="search"/)
+  assert.doesNotMatch(tty.content.at(-1).text, /dev_tool_search/)
   const timeout = await run('Error: command timed out')
   assert.match(timeout.content.at(-1).text, /run_in_background/)
+  assert.match(timeout.content.at(-1).text, /tool_gateway action="call" name="job_output"/)
   const invalid = await run('Error: invalid timeoutMs: expected a positive number')
   assert.equal(invalid.content.length, 1)
   const success = await hooks.get('tools/execute')(

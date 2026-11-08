@@ -232,6 +232,13 @@ test('explicit Agent Team prompt exposes team tools on the first request', async
   assert.ok(names.includes('spawn_teammate'), 'spawn_teammate must be in the first request catalog')
   assert.ok(names.includes('wait_agent'))
   assert.ok(names.includes('send_message'))
+  // The route note is a user-request fact, not a claim about THIS turn: the
+  // arming is sticky, so "本轮" would be false on every later turn.
+  const sections = (await fixture().assembly(s, teamCatalog)).sections
+  const note = sections.find(section => section.name === 'lean:team-route')
+  assert.ok(note, 'a user Team request must carry the route note')
+  assert.match(note.text, /本会话已启用/)
+  assert.doesNotMatch(note.text, /本轮用户显式/)
 })
 
 test('an ordinary prompt keeps the lean bootstrap catalog', async () => {
@@ -244,6 +251,85 @@ test('a plugin-injected reminder never arms Team routing', async () => {
   const s = fresh()
   userPrompt(s, '\u628a README \u91cd\u5199\u4e00\u4e0b')
   pluginReminder(s, 'Agent Team tools exist; use them when asked')
+  assert.deepEqual(await fixture().names(s, teamCatalog), ['bash', 'str_replace_editor'])
+})
+
+test('an explicit prohibition never arms Team routing', async () => {
+  const s = fresh()
+  userPrompt(s, '不要使用 Agent Team，不要开子代理，只做审查。')
+  const f = fixture()
+  assert.deepEqual(await f.names(s, teamCatalog), ['bash', 'str_replace_editor'])
+  const sections = (await f.assembly(s, teamCatalog)).sections
+  assert.deepEqual(sections.map(section => section.name), ['deployment:persona-prefix', 'plan:policy'])
+})
+
+test('a prohibition aimed at the ordinary subagent does not negate a later Team request', async () => {
+  const s = fresh()
+  userPrompt(s, '不要用普通 subagent，改用 Agent Team')
+  assert.ok((await fixture().names(s, teamCatalog)).includes('spawn_teammate'))
+})
+
+test('common prohibition expressions close an already-armed Team session', async () => {
+  const expressions = [
+    '不要使用 Agent Team，不要开子代理，只做审查。',
+    '不用 Agent Team，也不用 teammate。',
+    '不要开子代理，只做审查。',
+    'Agent Team 不要使用，只做审查。',
+    'Agent Team，不要使用，只做审查。',
+  ]
+  for (const text of expressions) {
+    const s = fresh()
+    userPrompt(s, '用 Agent Team 做这件事')
+    const f = fixture()
+    assert.ok((await f.names(s, teamCatalog)).includes('spawn_teammate'), `armed before: ${text}`)
+    userPrompt(s, text)
+    f.observe(s, s.ownEvents().at(-1))
+    const names = await f.names(s, teamCatalog)
+    assert.ok(!names.includes('spawn_teammate'), `closed by: ${text}`)
+    const sections = (await f.assembly(s, teamCatalog)).sections
+    assert.ok(!sections.some(section => section.name === 'lean:team-route'), `no route note: ${text}`)
+  }
+})
+
+test('a Team request followed by an ordinary-subagent prohibition stays armed', async () => {
+  const s = fresh()
+  userPrompt(s, '用 Agent Team，不要用普通 subagent')
+  assert.ok((await fixture().names(s, teamCatalog)).includes('spawn_teammate'))
+})
+
+test('a later explicit request re-arms Team after a prohibition', async () => {
+  const s = fresh()
+  userPrompt(s, '不要使用 Agent Team')
+  const f = fixture()
+  assert.ok(!(await f.names(s, teamCatalog)).includes('spawn_teammate'))
+  userPrompt(s, '现在用 Agent Team 做这件事')
+  f.observe(s, s.ownEvents().at(-1))
+  assert.ok((await f.names(s, teamCatalog)).includes('spawn_teammate'))
+})
+
+test('runtime Team-Lead identity arms the tools without the user-request note', async () => {
+  const s = fresh()
+  s.append('user/message', {
+    role: 'user',
+    source: { kind: 'runtime-context' },
+    content: [{ type: 'text', text: 'You are the Team Lead named lead. Use list_agents.' }],
+    id: `runtime-${s.seq}`,
+  }, { surfaceOp: 'append' })
+  const f = fixture()
+  assert.ok((await f.names(s, teamCatalog)).includes('spawn_teammate'))
+  const sections = (await f.assembly(s, teamCatalog)).sections
+  assert.deepEqual(sections.map(section => section.name), ['deployment:persona-prefix', 'plan:policy'])
+})
+
+test('a user prohibition overrides the runtime Team-Lead identity', async () => {
+  const s = fresh()
+  s.append('user/message', {
+    role: 'user',
+    source: { kind: 'runtime-context' },
+    content: [{ type: 'text', text: 'You are the Team Lead named lead.' }],
+    id: `runtime-${s.seq}`,
+  }, { surfaceOp: 'append' })
+  userPrompt(s, '不要使用 Agent Team，只做审查')
   assert.deepEqual(await fixture().names(s, teamCatalog), ['bash', 'str_replace_editor'])
 })
 

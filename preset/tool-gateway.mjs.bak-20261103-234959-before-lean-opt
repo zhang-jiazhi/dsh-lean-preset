@@ -284,7 +284,7 @@ const GATEWAY_ACTIONS = new Set(['search', 'describe', 'call', 'list'])
 /**
  * Team tools are gated by session arming, not by the gateway catalog. Naming
  * them as "not gateway tools" without that condition sent a real Team Lead
- * session (2026-10-31, session-example-a) into a dead end: the tools were absent
+ * session (2026-10-31, session-example-b) into a dead end: the tools were absent
  * from its catalog, the model tried `tool_gateway call list_agents`, and the
  * generic message told it "if it is visible, call it directly".
  */
@@ -447,7 +447,7 @@ const definition = (ctx) => ({
     // A hidden tool's schema is invisible until `describe`, so a wrong field
     // name only surfaces as the executor's generic rejection. Naming every
     // missing property in one message turns the guess-and-retry loop into one
-    // round: measured in session-example-a, where `update_goal` cost two failed
+    // round: measured in session-example-b, where `update_goal` cost two failed
     // calls (`id`/`phase`, then `expected_revision`) before the third succeeded.
     const schema = definitions.get(toolName)?.parameters
     const missing = missingRequiredProperties(schema, input)

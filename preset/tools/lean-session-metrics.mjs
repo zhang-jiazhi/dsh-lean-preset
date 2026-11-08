@@ -436,6 +436,14 @@ const emptyGateway = () => ({
   errors: 0,
   errorKinds: {},
   noMatchSearches: 0,
+  /**
+   * A batch gateway call reports partial failure as normal content text
+   * ("BATCH PARTIAL FAILURE: x/y") because the host's native executor marks a
+   * returned value as success. Count it separately from `isError` so the
+   * failure is not invisible to the error-rate discussion.
+   */
+  batchPartialFailures: 0,
+  batchFailedItems: 0,
   acquisitions: 0,
   sequences: 0,
   sequenceLengths: [],
@@ -701,6 +709,11 @@ export function buildSessionMetrics({ id, file, events, malformedLines = 0, enco
     const noMatch = action === 'search'
       && (call.noMatch === undefined ? /No gateway-eligible tools match/.test(asString(call.resultText)) : call.noMatch)
     if (noMatch) gateway.noMatchSearches += 1
+    const batchFailure = /BATCH PARTIAL FAILURE: (\d+)\/(\d+) calls failed/.exec(asString(call.resultText))
+    if (batchFailure !== null) {
+      gateway.batchPartialFailures += 1
+      gateway.batchFailedItems += Number(batchFailure[1])
+    }
     if (call.isError === true) {
       gateway.errors += 1
       const kind = gatewayErrorKind(action, asString(call.resultText))
@@ -987,6 +1000,8 @@ export function aggregateSessions(sessions, options = {}) {
         gateway.errors += session.gateway.errors
         mergeCounts(errorKinds, session.gateway.errorKinds)
         gateway.noMatchSearches += session.gateway.noMatchSearches
+        gateway.batchPartialFailures += session.gateway.batchPartialFailures
+        gateway.batchFailedItems += session.gateway.batchFailedItems
         gateway.acquisitions += session.gateway.acquisitions
         gateway.sequences += session.gateway.sequences
         gateway.sequenceLengths.push(...session.gateway.sequenceLengths)
@@ -1199,6 +1214,9 @@ export function renderText(report, options = {}) {
   const gateway = aggregate.gatewaySummary
   lines.push(`  calls ${gateway.calls} across ${gateway.sessionsUsingGateway} sessions · actions search=${gateway.actions.search} describe=${gateway.actions.describe} call=${gateway.actions.call} list=${gateway.actions.list} other=${gateway.actions.other}`)
   lines.push(`  errors ${gateway.errors} (${pct(gateway.calls > 0 ? gateway.errors / gateway.calls : null)}) · kinds ${JSON.stringify(gateway.errorKinds)}`)
+  if (gateway.batchPartialFailures > 0) {
+    lines.push(`  batch partial failures ${gateway.batchPartialFailures} calls · ${gateway.batchFailedItems} failed items (outer isError stays false)`)
+  }
   lines.push(`  acquisitions ${gateway.acquisitions} · callsPerAcquisition ${fmt(gateway.callsPerAcquisition, 2)} · sequences ${gateway.sequences} avgLength ${fmt(gateway.avgSequenceLength, 2)} maxLength ${fmt(gateway.maxSequenceLength)}`)
   lines.push(`  searchThenCall ${gateway.searchThenCall} (${pct(gateway.searchThenCallShare)} of acquisitions) · callWithoutSearch ${gateway.callWithoutSearch} · failedThenRetry ${gateway.failedThenRetry}`)
   lines.push(`  concentration: top session ${gateway.concentration.topSession?.id ?? 'n/a'} ${pct(gateway.concentration.topSessionShare)} · top3 ${pct(gateway.concentration.top3Share)}`)

@@ -38,7 +38,7 @@
 import { createEpochPromotion, ownSessionEvents } from './compaction-epoch.mjs?release=20260924-failed-compaction'
 import { resolveToolNames, schemaSizer } from './tool-name-resolver.mjs?release=20261024-unlockbudget'
 import { catalogFor, forgetCatalog, rememberCatalog } from './catalog-cache.mjs?release=20261028-022-exposure'
-import { markGatewayEligible } from './gateway-policy.mjs?release=20261029-gateway3'
+import { markGatewayEligible, unmarkGatewayEligible } from './gateway-policy.mjs?release=20261106-fixes'
 import { sleepGuardReason, writeGuardReason } from './write-guard.mjs?release=20261101-writeguard2'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -57,10 +57,39 @@ export const name = 'anchored-tool-bootstrap'
  */
 export const inject = []
 
-/** Resolve-mode admission state, keyed by Agent. */
-const resolveStateByAgent = new WeakMap()
-/** Scoped ToolsService -> its owning Agent (null when ambiguous). */
-const resolveAgentByTools = new WeakMap()
+/**
+ * Process-wide resolve registry, shared by every generation of this module.
+ *
+ * `lean.patch.yml` imports the implementation through a release URL so a source
+ * edit reaches the next assembly without a host restart. That creates a SECOND
+ * module instance: its `WeakMap` state table is fresh, while the `tools.resolve`
+ * wrapper installed by the previous generation still closes over the OLD table.
+ * The wrapper then found no state for the new Agent and threw
+ * "LEAN resolve exposure state is unavailable", making a hot-updated session
+ * unusable until the process restarted.
+ *
+ * The table therefore lives on `globalThis` behind a `Symbol.for` key, and the
+ * wrapper records which generation installed it (`installMethod` below) so a
+ * newer generation atomically restores the original method and installs its own
+ * wrapper. Wrapper and table are always from the same generation, while the
+ * table contents (plain Sets) stay readable across generations.
+ */
+const RESOLVE_REGISTRY_KEY = Symbol.for('@local/dsh-agent-preset-lean/resolve-registry')
+const resolveRegistry = (() => {
+  const shared = globalThis[RESOLVE_REGISTRY_KEY]
+  if (shared !== undefined && typeof shared === 'object' && shared.byAgent instanceof WeakMap) return shared
+  const created = { byAgent: new WeakMap(), agentByTools: new WeakMap(), generation: 0 }
+  globalThis[RESOLVE_REGISTRY_KEY] = created
+  return created
+})()
+/** Resolve-mode admission state, keyed by Agent. Shared across generations. */
+const resolveStateByAgent = resolveRegistry.byAgent
+/** Scoped ToolsService -> its owning Agent (null when ambiguous). Shared across generations. */
+const resolveAgentByTools = resolveRegistry.agentByTools
+/** This module instance's generation; bumped for every `?release=` import. */
+const GENERATION = ++resolveRegistry.generation
+/** Release tag imported by the matching entry file (also logged at mount). */
+const RELEASE = '20261106-fixes'
 
 /** Durable session event types that count as a promotion signal per mode. */
 const PROMOTE_EVENTS = {
@@ -279,6 +308,13 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
       `${name}: unknown config key(s) ${unknown.join(', ')} — allowed keys: ${[...ALLOWED_KEYS].sort().join(', ')}`,
     )
   }
+  // The .mjs graph is cached even when lean.patch.yml is hot-reloaded, so a
+  // session needs a log line that says which implementation is actually live.
+  try {
+    ctx.logger?.info?.(`${name}: release ${RELEASE} active (resolve registry generation ${GENERATION})`)
+  } catch {
+    // Logger unavailable in fixtures; the version marker is best-effort.
+  }
   const bootstrapTools = stringList(source.bootstrapTools ?? DEFAULT_BOOTSTRAP_TOOLS, 'bootstrapTools')
   const residentTools = stringList(source.residentTools ?? DEFAULT_RESIDENT_TOOLS, 'residentTools')
   // 20261017-audit-p0: subagents may need a smaller catalog than the top-level
@@ -331,7 +367,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
   const guardSleep = source.guardSleep !== false
   // Creating a *new* workspace file cannot invalidate read evidence, so bash may
   // create it (2026-11-01: strict new-file blocking measured 20.1% of bash calls
-  // in session-example-a, mostly one-off probe scripts). Set true to block those.
+  // in session-example-b, mostly one-off probe scripts). Set true to block those.
   const guardNewFileWrites = source.guardNewFileWrites === true
   // Middle state: `sed -i` / `cat >` / `tee` on existing files are allowed; only
   // scripted interpreter writes are blocked. `guardShellWrites: true` restores
@@ -411,7 +447,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     if (session === undefined || session === null) return
     promotion.forget(session.id)
     unlockedBySession.delete(session.id)
-    teamArmedBySession.delete(session.id)
+    teamStateBySession.delete(session.id)
     const disposedAgent = typeof ctx.get === 'function' ? ctx.get('agents')?.get?.(session.id) : undefined
     if (disposedAgent !== undefined && disposedAgent !== null) resolveStateByAgent.delete(disposedAgent)
     // Drop the catalog snapshot with the session: a lingering snapshot would
@@ -480,19 +516,13 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     return unlockedBySession.get(session.id) ?? scanUnlocked(session)
   }
 
-  // LEAN's top-level catalog stays core + tool_gateway; every non-core
+  // LEAN's catalog is the configured set + tool_gateway; every other
   // registration is filtered out of `tools.resolve()` for this Agent (see the
   // resolve filter below), and the gateway's private catalog remains the only
-  // path to on-demand capabilities.
+  // path to on-demand capabilities. There is deliberately NO union-of-lists
+  // "core" set: `subagent` is resident for the parent and hidden for the child,
+  // so admission is decided per Agent by keepToolsFor().
   const GATEWAY_TOOL_NAME = 'tool_gateway'
-  const coreToolNames = new Set([
-    ...bootstrapTools,
-    ...residentTools,
-    ...compactionTools,
-    ...subagentResidentTools,
-    ...subagentCompactionTools,
-    GATEWAY_TOOL_NAME,
-  ])
 
   /**
    * Agent Team tool set (2026-09-13). These are registered by
@@ -526,7 +556,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
    * The Agent Team plugin's own lead declaration, injected as a
    * `runtime-context` snapshot at session start (2026-10-31).
    *
-   * Measured in session-example-a (216 steps): the runtime snapshot told the
+   * Measured in session-example-b (216 steps): the runtime snapshot told the
    * model "You are the Team Lead named lead … use list_agents/send_message",
    * but the catalog had no Team tools because the first user message was just
    * two file paths. The model then spent a round calling `tool_gateway` with
@@ -536,37 +566,160 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
    * Deliberately narrow: generic runtime reminders must NOT arm Team.
    */
   const TEAM_LEAD_RUNTIME_PATTERN = /You are the Team Lead named/i
-  /** Section injected ONLY for an explicit-Team turn, so its cost is never paid otherwise. */
+  /**
+   * Section injected only when the USER asked for Team mode. It never says
+   * "本轮": the stance is sticky (see teamStateBySession), so the request may
+   * have been several turns ago.
+   */
   const TEAM_ROUTE_NOTE =
-    '本轮用户显式指定 Agent Team 子代理：组队与协作直接使用本轮已给出的团队工具（spawn_teammate 及 team_task_* / wait_agent / send_message），不要改用普通 subagent。'
+    '本会话已启用 Agent Team 子代理：组队与协作直接使用已给出的团队工具（spawn_teammate 及 team_task_* / wait_agent / send_message），不要改用普通 subagent。'
 
   /**
-   * Sessions whose user explicitly asked for the Agent Team, memoized like the
-   * unlock set. Only `source.kind === 'user'` counts: plugin-injected reminders
-   * are also `user/message` events, and letting one of them arm Team mode would
-   * change the tool catalog for a turn the user never asked about.
+   * Per-session Team state, memoized like the unlock set.
    *
-   * WHY THE INBOX IS THE SOURCE (2026-09-13, measured on a real session):
-   * `dsh-agent-loop` runs `inbox.claim()` → `systemPrompt.assemble()` →
-   * `session.append('user/message')`. At assembly time the current instruction
-   * has already been CLAIMED OUT of the inbox and not yet written to the log, so
-   * reading `ownEvents()` there cannot see it — the first request of a team turn
-   * would assemble with the plain bootstrap catalog and the model would reach
-   * for the resident `subagent`, exactly the failure being fixed. The durable
-   * `agent/inbox/spliced` event carries the full `inserted` messages and lands
-   * BEFORE assembly (seq 4 vs 11 in the measured run), which makes it the only
-   * source that is both early enough and resume-safe.
+   * The three inputs are deliberately separate:
+   *  - `identity`: the Team plugin's own runtime snapshot declares this session
+   *    the Team Lead. It is a runtime fact, not a user request.
+   *  - `stance`: the latest explicit USER statement: +1 = asked for Team,
+   *    -1 = explicitly forbade it, 0 = no explicit stance yet.
+   *  - effective = stance when stated, identity otherwise.
    *
-   * STICKY by construction: the flag latches on the first explicit Team
-   * instruction and is never cleared. A team task is inherently multi-turn
-   * (spawn → wait → send_message), so re-deriving from only the LATEST user text
-   * would drop `spawn_teammate` from the catalog the moment the user says
-   * "继续" — trading a wrong first call for a wrong second one. Latching also
-   * makes this survive compaction and resume for free: the arming splice and
-   * user message both stay in the durable log. Cost is paid only by sessions
-   * that really asked for a team.
+   * The previous implementation latched on ANY keyword hit and never cleared.
+   * "不要使用 Agent Team，不要开子代理，只做审查。" therefore ADDED the Team
+   * tools and injected "本轮用户显式指定 Agent Team" — the exact opposite of the
+   * instruction. A neutral follow-up ("继续") keeps the last explicit stance, so
+   * a real multi-turn team task still survives; a later explicit prohibition
+   * turns it off again.
+   *
+   * Only `source.kind === 'user'` sets the stance: plugin-injected reminders are
+   * also `user/message` events and must never arm Team. The durable
+   * `agent/inbox/spliced` event is also read because `dsh-agent-loop` runs
+   * `inbox.claim()` → `systemPrompt.assemble()` → `session.append('user/message')`:
+   * at assembly time the current instruction is in neither the inbox nor the log.
+   *
+   * Own events only, same reason as scanUnlocked: a fork seed copies the parent
+   * log, and the parent's instruction must not arm the child.
    */
-  const teamArmedBySession = new Map()
+  const teamStateBySession = new Map()
+
+  /** Clauses end at sentence or list punctuation; negation is only judged inside one. */
+  const TEAM_CLAUSE_BREAK = /[。；;！!？?，,、\n]/
+
+  /** Negation cues that turn a Team mention into a prohibition. */
+  const TEAM_NEGATION_PATTERN =
+    /(?:不要|不用|不需要|无需|不必|别(?=[用开启调走使])|勿|禁止|避免|不准|不许|停止|别再|不使用|不开|不启用|\bnot\b|\bdon'?t\b|\bdo\s+not\b|\bnever\b|\bwithout\b)/i
+
+  /**
+   * Post-negation: "Agent Team 不要使用" / "Agent Team should not be used".
+   * Only the head of the same clause is inspected, so "用 Agent Team，不要用普通
+   * subagent" does not negate the Team request.
+   */
+  const TEAM_POST_NEGATION_PATTERN =
+    /^\s*(?:(?:请|就|也|都|先|立即|马上|全部|直接|is|are|should|must|can|to)\s*)*(?:不要|不用|不需要|不必|别(?=[用开启调走使])|勿|禁止|避免|不准|不许|停止|禁用|关闭|停用|不使用|不开|不启用|\bnot\b|\bdon'?t\b|\bdo\s+not\b|\bnever\b|\bwithout\b)/i
+
+  /**
+   * A short next clause that unambiguously continues the prohibition, e.g.
+   * "Agent Team，不要使用，只做审查。" It must be a bare negation (optionally with
+   * "使用/用"), NOT a prohibition of "普通 subagent".
+   */
+  const TEAM_NEXT_CLAUSE_NEGATION_PATTERN =
+    /^\s*(?:(?:也|都|请|先|就|立即|马上)\s*)?(?:不要|不用|不需要|不必|别(?=[用开启调走使])|勿|禁止|避免|不准|不许|停止|禁用|关闭|停用)(?:\s*(?:再)?\s*(?:使用|用|开|开启|启用|调用|启动|走|继续|做|执行))?(?:\s*(?:它|这个|该功能|team|团队|teammate|agent[\s_-]*team))?\s*$/i
+
+  /**
+   * A prohibition that mentions only the delegation mechanism, without naming
+   * the Team: "不要开子代理，只做审查。" The audit expects this to close an
+   * already-armed Team mode, because Team tasks are delegation.
+   */
+  const DELEGATION_PROHIBITION_PATTERN =
+    /(?:不要|不用|不需要|无需|不必|别(?=[用开启调走使])|勿|禁止|避免|不准|不许|停止|别再|\bnot\b|\bdon'?t\b|\bdo\s+not\b|\bnever\b|\bwithout\b)\s*(?:再)?\s*(?:使用|用|开|开启|启用|调用|启动|走|派|委派)?\s*(?:普通\s*)?(?:子代理|subagent|委派|delegate|teammate|团队|team|agent[\s_-]*team)/gi
+
+  const TEAM_INTENT_GLOBAL = new RegExp(TEAM_INTENT_PATTERN.source, 'gi')
+
+  const clauseEndAfter = (text, from) => {
+    for (let index = from; index < text.length; index += 1) {
+      if (TEAM_CLAUSE_BREAK.test(text[index])) return index
+    }
+    return text.length
+  }
+
+  const nextClauseAfter = (text, end) => {
+    let start = end
+    while (start < text.length && TEAM_CLAUSE_BREAK.test(text[start])) start += 1
+    if (start >= text.length) return undefined
+    return text.slice(start, clauseEndAfter(text, start))
+  }
+
+  /**
+   * Polarity of the LAST explicit Team mention in one instruction, with
+   * prefix, suffix and (bare) next-clause negation. A bare delegation
+   * prohibition only decides when NO Team mention exists in the message:
+   * "用 Agent Team，不要用普通 subagent" keeps Team armed, while
+   * "不要开子代理" closes an armed session.
+   */
+  const teamStanceOf = (text) => {
+    let stance = 0
+    let sawMention = false
+    for (const match of text.matchAll(TEAM_INTENT_GLOBAL)) {
+      sawMention = true
+      let clauseStart = 0
+      for (let index = match.index - 1; index >= 0; index -= 1) {
+        if (TEAM_CLAUSE_BREAK.test(text[index])) {
+          clauseStart = index + 1
+          break
+        }
+      }
+      const suffixStart = match.index + match[0].length
+      const clauseEnd = clauseEndAfter(text, suffixStart)
+      const negated = TEAM_NEGATION_PATTERN.test(text.slice(clauseStart, match.index))
+        || TEAM_POST_NEGATION_PATTERN.test(text.slice(suffixStart, clauseEnd))
+        || TEAM_NEXT_CLAUSE_NEGATION_PATTERN.test(nextClauseAfter(text, clauseEnd) ?? '')
+      stance = negated ? -1 : 1
+    }
+    if (sawMention) return stance
+    for (const _match of text.matchAll(DELEGATION_PROHIBITION_PATTERN)) return -1
+    return 0
+  }
+
+  const emptyTeamState = () => ({ identity: false, stance: 0 })
+
+  const applyTeamSignal = (state, texts, runtimeTexts = []) => {
+    for (const text of runtimeTexts) {
+      if (!state.identity && TEAM_LEAD_RUNTIME_PATTERN.test(text)) state.identity = true
+    }
+    for (const text of texts) {
+      const stance = teamStanceOf(text)
+      if (stance !== 0) state.stance = stance
+    }
+  }
+
+  const scanTeamState = (session) => {
+    const state = emptyTeamState()
+    for (const event of ownSessionEvents(session)) {
+      applyTeamSignal(state, userTextsOfEvent(event), runtimeTextsOfEvent(event))
+    }
+    teamStateBySession.set(session.id, state)
+    return state
+  }
+
+  /** Incremental feed: fold this event's user/runtime text into the cached state. */
+  function observeUserPrompt(session, event) {
+    const state = teamStateBySession.get(session.id) ?? scanTeamState(session)
+    applyTeamSignal(state, userTextsOfEvent(event), runtimeTextsOfEvent(event))
+  }
+
+  const teamState = (session) => {
+    if (session === undefined || session === null) return emptyTeamState()
+    return teamStateBySession.get(session.id) ?? scanTeamState(session)
+  }
+
+  /** Effective Team mode: an explicit user stance overrides the runtime identity. */
+  const teamArmed = (session) => {
+    const state = teamState(session)
+    return state.stance === 0 ? state.identity : state.stance > 0
+  }
+
+  /** The user (not the runtime snapshot) asked for Team mode. */
+  const userAskedForTeam = (session) => teamState(session).stance > 0
 
   /** Prose of one message-shaped value, when it is a real user instruction. */
   const userTextOf = (message) => {
@@ -636,61 +789,6 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
       return texts
     }
     return []
-  }
-
-  /**
-   * Latch Team mode when one user instruction explicitly names the Team, or when
-   * the Team plugin's runtime snapshot declares this session to be the Team Lead.
-   */
-  const latchTeamArmed = (session, texts, runtimeTexts = []) => {
-    if (teamArmedBySession.get(session.id) === true) return
-    for (const text of texts) {
-      if (TEAM_INTENT_PATTERN.test(text)) {
-        teamArmedBySession.set(session.id, true)
-        return
-      }
-    }
-    for (const text of runtimeTexts) {
-      if (TEAM_LEAD_RUNTIME_PATTERN.test(text)) {
-        teamArmedBySession.set(session.id, true)
-        return
-      }
-    }
-  }
-
-  const scanTeamArmed = (session) => {
-    let armed = false
-    // Own events only, same reason as scanUnlocked: a fork seed copies the
-    // parent's log, and the parent's instruction must not arm the child.
-    for (const event of ownSessionEvents(session)) {
-      for (const text of userTextsOfEvent(event)) {
-        if (TEAM_INTENT_PATTERN.test(text)) {
-          armed = true
-          break
-        }
-      }
-      if (armed) break
-      for (const text of runtimeTextsOfEvent(event)) {
-        if (TEAM_LEAD_RUNTIME_PATTERN.test(text)) {
-          armed = true
-          break
-        }
-      }
-      if (armed) break
-    }
-    teamArmedBySession.set(session.id, armed)
-    return armed
-  }
-
-  /** Incremental feed: latch Team mode when this event carries an explicit request. */
-  function observeUserPrompt(session, event) {
-    latchTeamArmed(session, userTextsOfEvent(event), runtimeTextsOfEvent(event))
-  }
-
-  const teamArmed = (session) => {
-    if (session === undefined || session === null) return false
-    const cached = teamArmedBySession.get(session.id)
-    return cached === undefined ? scanTeamArmed(session) : cached
   }
 
   /** A spawned child may message its Team parent, but a fork does not inherit that right. */
@@ -837,80 +935,174 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     return hinted
   }
 
+  /** Symbol slot holding the wrapper record for one method, on the patched object. */
+  const RESOLVE_INSTALL_KEY = Symbol.for('@local/dsh-agent-preset-lean/resolve-install')
+  const EXECUTABLE_INSTALL_KEY = Symbol.for('@local/dsh-agent-preset-lean/resolve-executable-install')
+  /** Markers written by the pre-20261106 implementation. */
+  const LEGACY_FILTER_KEY = Symbol.for('@local/dsh-agent-preset-lean/resolve-filter')
+  const LEGACY_EXECUTABLE_KEY = Symbol.for('@local/dsh-agent-preset-lean/resolve-executable')
+
+  /** The nearest object on the chain carrying a legacy (pre-20261106) marker. */
+  const legacyOwnerOf = (target, key) => {
+    let node = target
+    while (node !== null && node !== undefined) {
+      if (Object.prototype.hasOwnProperty.call(node, key)) return node
+      node = Object.getPrototypeOf(node)
+    }
+    return undefined
+  }
+
+  /**
+   * Detach a legacy wrapper ONLY when it is an own property that shadows a
+   * still-reachable prototype method. The legacy implementation captured its
+   * original in a closure and stored no reference, so a wrapper installed on the
+   * prototype (the real-host case) cannot be unwrapped in-process.
+   */
+  const detachLegacyOwnWrapper = (tools, owner, marker, method) => {
+    if (owner === undefined) return true
+    // The old marker was defined non-configurable. Once the own wrapper is
+    // gone, the marker is stale; ignore it instead of warning forever.
+    if (!Object.prototype.hasOwnProperty.call(owner, method)) return true
+    if (owner === Object.getPrototypeOf(tools)) return false
+    const parent = Object.getPrototypeOf(owner)
+    const inherited = parent?.[method]
+    if (typeof inherited !== 'function' || inherited === owner[method]) return false
+    delete owner[method]
+    try { delete owner[marker] } catch { /* non-configurable: stale marker, handled above */ }
+    return typeof owner[method] === 'function'
+  }
+
+  /** The nearest object on the prototype chain that owns this method's wrapper record. */
+  const wrapperOwnerOf = (target, key) => {
+    let node = target
+    while (node !== null && node !== undefined) {
+      if (Object.prototype.hasOwnProperty.call(node, key)) return node
+      node = Object.getPrototypeOf(node)
+    }
+    return undefined
+  }
+
+  /**
+   * Install or replace one generation's method wrapper.
+   *
+   * A wrapper from an older generation is restored first: nesting generations
+   * would filter the same ToolSet twice, and the outer wrapper's state table
+   * belongs to a module instance the host no longer calls into. A newer
+   * generation always wins, so a stale plugin instance syncing after a hot
+   * reload cannot downgrade the filter.
+   */
+  const installMethod = (target, key, method, wrap) => {
+    if (target === undefined || target === null) return
+    const ownRecord = Object.prototype.hasOwnProperty.call(target, key) ? target[key] : undefined
+    if (ownRecord !== undefined) {
+      if (ownRecord.generation >= GENERATION) return
+      ownRecord.restore()
+    }
+    const original = target[method]
+    if (typeof original !== 'function') return
+    const hadOwn = Object.prototype.hasOwnProperty.call(target, method)
+    const replacement = wrap(original)
+    target[method] = replacement
+    Object.defineProperty(target, key, {
+      value: {
+        generation: GENERATION,
+        restore() {
+          try { delete target[key] } catch { /* non-configurable, leave it */ }
+          if (hadOwn) target[method] = original
+          else delete target[method]
+        },
+      },
+      configurable: true,
+    })
+  }
+
+  const wrapResolve = (original) => async function (context) {
+    const resolved = await original.call(this, context)
+    const agent = context?.agent
+    const state = resolveStateByAgent.get(agent)
+    if (state === undefined) {
+      const preset = agent?.session?.header?.agentPreset
+      if (preset !== undefined && preset !== 'lean') return resolved
+      throw new Error('LEAN resolve exposure state is unavailable for this Agent')
+    }
+    const allowed = new Set()
+    for (const [toolName] of resolved.view(agent)) {
+      const isTeam = state.teamNames.includes(toolName)
+      if (toolName === 'run_code' || (isTeam ? state.teamAllowed.has(toolName) : state.keep.has(toolName))) allowed.add(toolName)
+    }
+    return Object.freeze({
+      dispose: resolved.dispose,
+      view: (scope) => {
+        const current = resolved.view(scope)
+        if (scope !== agent) return current
+        return new Map([...current]
+          .filter(([toolName]) => allowed.has(toolName))
+          .map(([toolName, definition]) => [toolName, withDescriptionHint(definition)]))
+      },
+    })
+  }
+
+  const wrapExecutable = (originalExecutable) => function (name, scope, toolSet) {
+    if (toolSet !== undefined) return originalExecutable.call(this, name, scope, toolSet)
+    const agents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
+    const explicitAgent = typeof scope === 'string' ? agents?.get?.(scope) : scope
+    const ownerAgent = scope === undefined ? resolveAgentByTools.get(this) : undefined
+    const agent = explicitAgent === undefined || explicitAgent === null ? ownerAgent : explicitAgent
+    if (agent === undefined || agent === null) {
+      // No step admission and no unambiguous Agent owner: never expose a
+      // managed tool outside the resolve allow-set. run_code remains the
+      // reserved PTC transport and is admitted by the executor itself.
+      return name === 'run_code' ? originalExecutable.call(this, name, scope, toolSet) : undefined
+    }
+    const state = resolveStateByAgent.get(agent)
+    if (state === undefined) {
+      const preset = agent?.session?.header?.agentPreset
+      if (preset !== undefined && preset !== 'lean') return originalExecutable.call(this, name, scope, toolSet)
+      return name === 'run_code' ? originalExecutable.call(this, name, scope, toolSet) : undefined
+    }
+    const isTeam = state.teamNames.includes(name)
+    const allowed = name === 'run_code' || (isTeam ? state.teamAllowed.has(name) : state.keep.has(name))
+    return allowed ? originalExecutable.call(this, name, scope, toolSet) : undefined
+  }
+
   /** Filter an admitted ToolSet once, instead of wrapping registrations. */
   const installResolveFilterOn = (tools, ownerAgent) => {
-    if (tools === undefined || tools === null || typeof tools.resolve !== 'function') return
+    if (tools === undefined || tools === null) return
+    const hasResolve = typeof tools.resolve === 'function'
+    const hasExecutable = typeof tools.executable === 'function'
+    if (!hasResolve && !hasExecutable) return
+    // A host that hot-reloaded from the pre-20261106 implementation still has
+    // the old wrapper installed. The new generation must not wrap that closure
+    // (it reads a private state table and throws); detect it and require the
+    // controlled restart that actually clears the module graph.
+    const legacyFilterOwner = legacyOwnerOf(tools, LEGACY_FILTER_KEY)
+    const legacyExecutableOwner = legacyOwnerOf(tools, LEGACY_EXECUTABLE_KEY)
+    if (legacyFilterOwner !== undefined || legacyExecutableOwner !== undefined) {
+      const detachedFilter = detachLegacyOwnWrapper(tools, legacyFilterOwner, LEGACY_FILTER_KEY, 'resolve')
+      const detachedExecutable = detachLegacyOwnWrapper(tools, legacyExecutableOwner, LEGACY_EXECUTABLE_KEY, 'executable')
+      if (!detachedFilter || !detachedExecutable) {
+        warnOnce(`${name}: a pre-20261106 resolve wrapper is still installed and cannot be unwrapped in-process (its original method is captured in a closure). RESTART the host to finish this upgrade; new sessions may fail with "LEAN resolve exposure state is unavailable for this Agent" until then.`)
+        return
+      }
+      warnOnce(`${name}: detached a recoverable pre-20261106 resolve wrapper; a restart is still recommended for the rest of the process`)
+    }
     if (ownerAgent !== undefined && ownerAgent !== null) {
       const current = resolveAgentByTools.get(tools)
       if (current === undefined) resolveAgentByTools.set(tools, ownerAgent)
       else if (current !== ownerAgent) resolveAgentByTools.set(tools, null)
     }
-    const targets = []
     const proto = Object.getPrototypeOf(tools)
-    const inheritedPatched = proto !== undefined && proto !== null && proto[Symbol.for('@local/dsh-agent-preset-lean/resolve-filter')] !== undefined
-    if (!inheritedPatched && proto !== undefined && proto !== null && typeof proto.resolve === 'function') targets.push(proto)
-    targets.push(tools)
-    for (const target of targets) {
-      const key = Symbol.for('@local/dsh-agent-preset-lean/resolve-filter')
-      if (target[key] === undefined) {
-        const original = target.resolve
-        target.resolve = async function (context) {
-          const resolved = await original.call(this, context)
-          const agent = context?.agent
-          const state = resolveStateByAgent.get(agent)
-          if (state === undefined) {
-            const preset = agent?.session?.header?.agentPreset
-            if (preset !== undefined && preset !== 'lean') return resolved
-            throw new Error('LEAN resolve exposure state is unavailable for this Agent')
-          }
-          const allowed = new Set()
-          for (const [toolName] of resolved.view(agent)) {
-            const isTeam = state.teamNames.includes(toolName)
-            if (toolName === 'run_code' || (isTeam ? state.teamAllowed.has(toolName) : state.keep.has(toolName))) allowed.add(toolName)
-          }
-          let filtered
-          filtered = Object.freeze({
-            dispose: resolved.dispose,
-            view: (scope) => {
-              const current = resolved.view(scope)
-              if (scope !== agent) return current
-              return new Map([...current]
-                .filter(([toolName]) => allowed.has(toolName))
-                .map(([toolName, definition]) => [toolName, withDescriptionHint(definition)]))
-            },
-          })
-          return filtered
-        }
-        Object.defineProperty(target, key, { value: true })
-      }
-
-      const executableKey = Symbol.for('@local/dsh-agent-preset-lean/resolve-executable')
-      if (typeof target.executable === 'function' && target[executableKey] === undefined) {
-        const originalExecutable = target.executable
-        target.executable = function (name, scope, toolSet) {
-          if (toolSet !== undefined) return originalExecutable.call(this, name, scope, toolSet)
-          const agents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
-          const explicitAgent = typeof scope === 'string' ? agents?.get?.(scope) : scope
-          const ownerAgent = scope === undefined ? resolveAgentByTools.get(this) : undefined
-          const agent = explicitAgent === undefined || explicitAgent === null ? ownerAgent : explicitAgent
-          if (agent === undefined || agent === null) {
-            // No step admission and no unambiguous Agent owner: never expose a
-            // managed tool outside the resolve allow-set. run_code remains the
-            // reserved PTC transport and is admitted by the executor itself.
-            return name === 'run_code' ? originalExecutable.call(this, name, scope, toolSet) : undefined
-          }
-          const state = resolveStateByAgent.get(agent)
-          if (state === undefined) {
-            const preset = agent?.session?.header?.agentPreset
-            if (preset !== undefined && preset !== 'lean') return originalExecutable.call(this, name, scope, toolSet)
-            return name === 'run_code' ? originalExecutable.call(this, name, scope, toolSet) : undefined
-          }
-          const isTeam = state.teamNames.includes(name)
-          const allowed = name === 'run_code' || (isTeam ? state.teamAllowed.has(name) : state.keep.has(name))
-          return allowed ? originalExecutable.call(this, name, scope, toolSet) : undefined
-        }
-        Object.defineProperty(target, executableKey, { value: true })
-      }
+    // A wrapper already installed anywhere on the chain is the patch point:
+    // replacing it in place keeps the chain free of shadowing duplicates.
+    const resolveTarget = wrapperOwnerOf(tools, RESOLVE_INSTALL_KEY)
+      ?? (proto !== null && proto !== undefined && typeof proto.resolve === 'function' ? proto : tools)
+    if (hasResolve || typeof resolveTarget.resolve === 'function') {
+      installMethod(resolveTarget, RESOLVE_INSTALL_KEY, 'resolve', wrapResolve)
+    }
+    const executableTarget = wrapperOwnerOf(tools, EXECUTABLE_INSTALL_KEY)
+      ?? (proto !== null && proto !== undefined && typeof proto.executable === 'function' ? proto : tools)
+    if (hasExecutable || typeof executableTarget.executable === 'function') {
+      installMethod(executableTarget, EXECUTABLE_INSTALL_KEY, 'executable', wrapExecutable)
     }
   }
 
@@ -950,10 +1142,29 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
         })()
         rememberCatalog(session.id, catalog)
       }
+      // The gateway the CURRENT caller cannot see is exactly what it may call
+      // through the gateway. Eligibility is therefore marked per Agent against
+      // this Agent's kept set, not against the union of every configured list:
+      // `subagent` is resident at top level but deliberately absent from the
+      // child list, and a union made the child's gateway reject it as
+      // "not gateway-eligible" even though its own catalog hid it.
+      const keep = keepToolsFor(agent, catalog)
+      const markHiddenForAgent = (toolName, registration) => {
+        if (toolName === GATEWAY_TOOL_NAME) return
+        if (TEAM_TOOL_NAMES.includes(toolName)) return
+        if (keep.has(toolName)) {
+          // A phase change can make a hidden tool resident (`subagent` after
+          // promotion). Its old mark must go, or the gateway would keep serving
+          // a tool the model can already call directly.
+          unmarkGatewayEligible(registration.definition, agent)
+          return
+        }
+        markGatewayEligible(registration.definition, registration.when, agent)
+      }
       // Only definitions that are visible in this agent's catalog after other
-      // plugins' restrictions may be called through the gateway: a global tool
-      // hidden by an unrelated plugin's `when` must stay unavailable, and a
-      // conditional tool keeps its own condition for the gateway to re-evaluate.
+      // plugins' restrictions may be reached: a global tool hidden by an
+      // unrelated plugin's `when` must stay unavailable, and a conditional tool
+      // keeps its own condition for the gateway to re-evaluate.
       const visibleNames = new Set(catalogNamesOf(catalog))
       const globalView = toolsService !== undefined && typeof toolsService.view === 'function'
         ? toolsService.view()
@@ -961,9 +1172,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
       if (globalView !== undefined) {
         for (const [toolName, registration] of globalView.registrations) {
           if (!visibleNames.has(toolName)) continue
-          if (toolName !== GATEWAY_TOOL_NAME && !coreToolNames.has(toolName) && !TEAM_TOOL_NAMES.includes(toolName)) {
-            markGatewayEligible(registration.definition, registration.when)
-          }
+          markHiddenForAgent(toolName, registration)
         }
       }
       // The browser/MCP provider opens a child scope and registers tools after
@@ -973,13 +1182,11 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
         : undefined
       if (agentView !== undefined) {
         for (const [toolName, registration] of agentView.registrations) {
-          if (toolName === GATEWAY_TOOL_NAME || (coreToolNames.has(toolName) && !TEAM_TOOL_NAMES.includes(toolName))) continue
-          if (!TEAM_TOOL_NAMES.includes(toolName)) markGatewayEligible(registration.definition, registration.when)
+          markHiddenForAgent(toolName, registration)
         }
       }
       installResolveFilterOn(agent?.ctx?.tools, agent)
       installWriteGuard(agent)
-      const keep = keepToolsFor(agent, catalog)
       resolveStateByAgent.set(agent, {
         keep,
         preset: session?.header?.agentPreset,
@@ -1014,7 +1221,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
         const catalog = assembled.tools
         const keep = keepToolsFor(context.agent, catalog)
         const teamTools = teamToolsFor(catalog, session)
-        const teamSection = !teamArmed(session) || teamTools.length === 0 ? [] : [{ name: 'lean:team-route', text: TEAM_ROUTE_NOTE }]
+        const teamSection = !userAskedForTeam(session) || teamTools.length === 0 ? [] : [{ name: 'lean:team-route', text: TEAM_ROUTE_NOTE }]
         return {
           ...assembled,
           tools: catalog.filter((tool) => keep.has(tool.name)),
@@ -1024,7 +1231,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
       }
       const catalog = catalogFor(session?.id)
       const teamTools = teamToolsFor(catalog, session)
-      const teamSection = !teamArmed(session) || teamTools.length === 0 ? [] : [{ name: 'lean:team-route', text: TEAM_ROUTE_NOTE }]
+      const teamSection = !userAskedForTeam(session) || teamTools.length === 0 ? [] : [{ name: 'lean:team-route', text: TEAM_ROUTE_NOTE }]
       return {
         ...assembled,
         sections: [{ name: 'deployment:persona-prefix', text: bootstrapPersona }, ...planPolicySections(assembled), ...keptSectionsOf(assembled, keptSectionNames, promoted), ...teamSection],

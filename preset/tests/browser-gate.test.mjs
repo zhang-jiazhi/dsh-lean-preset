@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { apply as bootstrap } from '../tool-bootstrap.mjs'
 import { apply as gateway } from '../tool-gateway.mjs'
-import { isGatewayEligible, originalWhenFor } from '../gateway-policy.mjs?release=20261029-gateway3'
+import { isGatewayEligible, originalWhenFor } from '../gateway-policy.mjs?release=20261106-fixes'
 import { runtime } from './runtime-helper.mjs'
 
 const { Session, SESSION_FORMAT_VERSION } = await runtime('@deepseek-ai/dsh-session')
@@ -125,7 +125,7 @@ test('a scoped MCP tool never reaches the lean catalog but stays gateway-reachab
   f.tools.register(click)
   sync(f.hooks, f.agent.session)
   assert.deepEqual(await view(f), ['bash', 'tool_gateway'])
-  assert.equal(isGatewayEligible(click), true)
+  assert.equal(isGatewayEligible(click, f.agent), true)
   assert.equal(originalWhenFor(click), undefined)
   let gatewayTool
   const register = f.tools.register.bind(f.tools)
@@ -136,6 +136,61 @@ test('a scoped MCP tool never reaches the lean catalog but stays gateway-reachab
   gateway({ tools: f.tools })
   const listed = await gatewayTool.execute({ action: 'search', query: 'browser_click' }, { agent: f.agent })
   assert.match(listed.text, /mcp__playwright-mcp__browser_click/)
+})
+
+test('a delegation child reaches subagent through its own gateway', async () => {
+  const subagent = definition('subagent')
+  const childSession = Session.create('child-gateway', [], {
+    version: SESSION_FORMAT_VERSION,
+    id: 'child-gateway',
+    createdAt: Date.now(),
+    isSeeded: false,
+    agentPreset: 'lean',
+    parentSession: 'parent-gateway',
+    delegationDepth: 1,
+  })
+  const f = harness({
+    defs: [definition('bash'), definition('tool_gateway'), subagent],
+    session: childSession,
+    extraConfig: {
+      subagentResidentTools: ['bash', 'tool_gateway'],
+      subagentCompactionTools: ['bash', 'tool_gateway'],
+    },
+  })
+  f.tools.register(subagent)
+  sync(f.hooks, childSession)
+  assert.deepEqual(await view(f), ['bash', 'tool_gateway'], 'the child resident list hides subagent')
+  assert.equal(isGatewayEligible(subagent, f.agent), true)
+  f.tools.execute = async () => ({
+    results: [{ result: { content: [{ type: 'text', text: 'spawned' }] } }],
+  })
+  let gatewayTool
+  const register = f.tools.register.bind(f.tools)
+  f.tools.register = (tool) => {
+    if (tool.name === 'tool_gateway') gatewayTool = tool
+    return register(tool)
+  }
+  gateway({ tools: f.tools })
+  const described = await gatewayTool.execute({ action: 'describe', name: 'subagent' }, { agent: f.agent })
+  assert.match(described.text, /"name": "subagent"/)
+  const called = await gatewayTool.execute(
+    { action: 'call', name: 'subagent', input: {} },
+    { agent: f.agent, signal: new AbortController().signal },
+  )
+  assert.equal(called.text, 'spawned')
+
+  // The same registration is resident at top level, so the parent's gateway
+  // must keep rejecting it (no accidental global eligibility).
+  const parent = harness({
+    defs: [definition('bash'), definition('tool_gateway'), subagent],
+    session: makeSession('parent-gateway'),
+    resident: ['bash', 'tool_gateway', 'subagent'],
+  })
+  parent.tools.register(subagent)
+  sync(parent.hooks, parent.agent.session)
+  promote(parent)
+  assert.deepEqual(await view(parent), ['bash', 'subagent', 'tool_gateway'])
+  assert.equal(isGatewayEligible(subagent, parent.agent), false)
 })
 
 test('a non-lean Agent is untouched by the resolve filter', async () => {
@@ -155,9 +210,9 @@ test('resident core and the gateway are never gateway-eligible', async () => {
   const f = harness({ defs: [bash, gw, click], session: makeSession('core-eligibility') })
   for (const tool of [bash, gw, click]) f.tools.register(tool)
   sync(f.hooks, f.agent.session)
-  assert.equal(isGatewayEligible(bash), false)
-  assert.equal(isGatewayEligible(gw), false)
-  assert.equal(isGatewayEligible(click), true)
+  assert.equal(isGatewayEligible(bash, f.agent), false)
+  assert.equal(isGatewayEligible(gw, f.agent), false)
+  assert.equal(isGatewayEligible(click, f.agent), true)
 })
 
 test('Team tools appear in the resolve view only after an explicit Team intent', async () => {

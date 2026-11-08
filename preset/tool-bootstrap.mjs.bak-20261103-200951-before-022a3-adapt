@@ -331,7 +331,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
   const guardSleep = source.guardSleep !== false
   // Creating a *new* workspace file cannot invalidate read evidence, so bash may
   // create it (2026-11-01: strict new-file blocking measured 20.1% of bash calls
-  // in session-example-a, mostly one-off probe scripts). Set true to block those.
+  // in session-example-b, mostly one-off probe scripts). Set true to block those.
   const guardNewFileWrites = source.guardNewFileWrites === true
   // Middle state: `sed -i` / `cat >` / `tee` on existing files are allowed; only
   // scripted interpreter writes are blocked. `guardShellWrites: true` restores
@@ -526,7 +526,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
    * The Agent Team plugin's own lead declaration, injected as a
    * `runtime-context` snapshot at session start (2026-10-31).
    *
-   * Measured in session-example-a (216 steps): the runtime snapshot told the
+   * Measured in session-example-b (216 steps): the runtime snapshot told the
    * model "You are the Team Lead named lead … use list_agents/send_message",
    * but the catalog had no Team tools because the first user message was just
    * two file paths. The model then spent a round calling `tool_gateway` with

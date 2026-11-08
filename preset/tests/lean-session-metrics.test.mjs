@@ -467,6 +467,21 @@ test('buildSessionMetrics flags unknown-tool gateway calls', () => {
   assert.equal(metrics.gateway.callsPerAcquisition, null)
 })
 
+test('buildSessionMetrics counts partial batch failures separately from isError', () => {
+  const events = [
+    session('session-gw-batch', 'lean'),
+    stepStart(2, 1, 1),
+    header(3, 'initial', [bashTool]),
+    assistant(4),
+    toolCall(5, 'b1', 'tool_gateway', { action: 'call', calls: [{ name: 'hidden_fail' }, { name: 'hidden_read' }] }),
+    toolResult(6, 'b1', 'BATCH PARTIAL FAILURE: 1/2 calls failed (hidden_fail). Failed items are labeled ERROR above; retry only those.', false),
+  ]
+  const metrics = buildSessionMetrics({ id: 'session-gw-batch', file: 'synthetic', events, records: [] })
+  assert.equal(metrics.gateway.errors, 0, 'the outer gateway result is a success')
+  assert.equal(metrics.gateway.batchPartialFailures, 1)
+  assert.equal(metrics.gateway.batchFailedItems, 1)
+})
+
 test('buildSessionMetrics separates shell exit codes from harness isError', () => {
   const alpha = loadAlpha()
   assert.equal(alpha.shell.calls, 2)

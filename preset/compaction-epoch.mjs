@@ -74,7 +74,7 @@ export function sessionEvents(session) {
  * loaded-topic versions (rules-hybrid), and the loaded-skill versions
  * (skill-search). Over the real sessions the core block was re-sent 41 times
  * beyond the `1 + successful compactions` expectation (1,306 chars each,
- * ~330 tokens). `session-example-c` alone accounts for 21 of them.
+ * ~330 tokens). `session-example-a` alone accounts for 21 of them.
  * It also re-narrows the tool catalog mid-conversation: of the 35 failed
  * compactions followed by another request, 13 changed the catalog (one session
  * oscillated 20 -> 14 -> 20 five times).

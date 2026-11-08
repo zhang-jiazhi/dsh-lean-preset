@@ -98,10 +98,13 @@
             #   sed -i、cat >、tee 放行，新建文件放行，≥30 秒 sleep 拒绝。
             #   实测严格模式占 bash 调用 18.7%，中间态约 4.4%（写 2.7% + 睡眠 1.7%）。
             #   配置 guardWorkspaceWrites / guardSleep / guardNewFileWrites / guardShellWrites。
-            name: '@local/dsh-agent-preset-lean/tool-bootstrap-entry-20261103-022a3.mjs'
+            # 20261106-fixes：跨代 resolve 状态共享/原子换代；Team 否定指令与
+            # 运行时 Team-Lead 身份分离；gateway eligibility 按调用 Agent 判定。
+            # 换入口文件 + release URL，确保仍在运行的宿主下一次装配拿到新实现。
+            name: '@local/dsh-agent-preset-lean/tool-bootstrap-entry-20261106-fixes.mjs'
             config:
               # 20261031-toolhints2：edit/write 的 schema 描述尾部追加读证据约束
-              #   （“edit 需要先 read；bash 写入会作废证据”）。真实会话 session-example-a
+              #   （“edit 需要先 read；bash 写入会作废证据”）。真实会话 session-example-b
               #   里 70% 的文件改动走 bash（29 次 python heredoc vs 13 次 edit/write），
               #   并因此产生 1 次 file changed since it was read；AGENTS 规则在第 200 步
               #   时已远离上下文，而 schema 每步都在。read 的同类提示做过 N=10×2 A/B：
@@ -109,7 +112,7 @@
               #   edit+write 只影响晋升后的目录，裁剪后 +217 字符。
               # 20261031-teamlead：Team 布防新增一条来源——Team 插件在会话开始时
               #   注入的 runtime-context 快照（"You are the Team Lead named …"）。
-              #   实测（session-example-a，216 步）：快照让模型去用 list_agents，但首条
+              #   实测（session-example-b，216 步）：快照让模型去用 list_agents，但首条
               #   用户消息只是两个文件路径，Team 未布防 → 目录里没有团队工具，模型花
               #   一轮调 gateway 拿 "not gateway-eligible"。这条标记是团队插件自己声明
               #   "本会话就是 Team"，因此从第 1 个请求起布防；普通 runtime 提醒不会命中。
@@ -127,18 +130,20 @@
               # 20261030-audit（本轮）：str_replace_editor 已从首轮移除。三条依据：
               #   1) 185 个历史 lean 会话里它只有 27 次调用、集中在 2 个会话，**从无会话
               #      在第 1 步用它编辑**（首调用真正读文件内容的只有 27/147）；
-              #   2) 它在 coreToolNames 里（tool-bootstrap.mjs 的 register 钩子直接放行），
+              #   2) 它曾落在旧的 coreToolNames 并集里（早期用 register 钩子直接放行），
               #      因此晋升后既不在常驻集、也不进 gateway 私有目录——等于不可达；
-              #      移出后它变成 gateway-eligible，需要时可按需取回，能力不丢；
+              #      移出后按调用 Agent 的 keep 集判定为 hidden，变成 gateway-eligible，
+              #      需要时可按需取回，能力不丢；
               #   3) 真实 A/B（leanbench，同任务同模型各 N=5）：首请求 schema
               #      8,515→5,412 字符（-36.4%，零方差），任务完成率 5/5 无退化，
               #      请求数/工具调用在方差内（5–7）。
               #   首轮仍保留 read（避免首轮 cat/sed）与 rule_load、tool_gateway。
               #   回退：把 str_replace_editor 加回本列表即可。
               # 20261103-lean-opt：read_image 加入 bootstrap。用户发图后的第一轮就要
-              #   看图，而 read_image 在 resident/coreToolNames 里，gateway 按设计拒绝
-              #   它（tool-gateway 只暴露被故意隐藏的非 core 工具，见
-              #   tests/browser-gate.test.mjs:151 的不变量）；不在 bootstrapTools 里
+              #   看图，而 read_image 在 resident 集里，gateway 按设计拒绝
+              #   它（tool-gateway 只暴露当前阶段被故意隐藏的工具，见
+              #   tests/browser-gate.test.mjs 的 "resident core and the gateway are
+              #   never gateway-eligible"）；不在 bootstrapTools 里
               #   就会出现「既不可见、也不可经 gateway 调」的死路（真实会话 00:02:45
               #   的 4-工具首请求踩到）。代价是首请求 +403 字符（read_image schema），
               #   bootstrap 只持续 1–2 轮，可忽略。回退：从本列表删 read_image 即可。
@@ -183,7 +188,10 @@
               # 只能从 describe 的 schema 里读到一句 "prefer it over multiple edit
               # calls"，引导强度不足。A/B：两三个会话后若 apply_patch 调用率仍为 0，
               # 删掉 'tool:apply_patch' 即回退。
-              keptSections: ['tool:jobs', 'tool:apply_patch']
+              # 20261107-observed：普通委派实测出现 sleep 与 Team 等待工具检索。
+              # 保留宿主已有的异步回执指引（仅晋升后；两种入口只渲染一段），
+              # 不扩大 bootstrap，不添加新规则，也不把普通子代理 id 当 job id。
+              keptSections: ['tool:jobs', 'tool:apply_patch', 'tool:subagent', 'tool:subagent_fork']
               # Post-promotion resident whitelist: the core work set the model can use
               # without unlocking. exit_plan_mode is REQUIRED resident — the plan mode
               # exit — otherwise a plan-mode session cannot leave. Everything else
@@ -251,6 +259,9 @@
               #   grep/glob 于 20261103 一并移出（child 内用 bash 或经 gateway）。
               #   child 仍保留 bash/read/write/edit/todo/read_image/ask_user_question/
               #   tool_gateway/rule_load/send_message/web_fetch。
+              #   20261106：gateway eligibility 改为按调用 Agent 的实际 keep 集判定
+              #   （不再用父子名单的并集），所以 child 经 tool_gateway 调用 subagent
+              #   不再被 "not gateway-eligible" 拒绝；顶层因 subagent 常驻仍会拒绝。
               subagentResidentTools: [bash, read, write, edit, todo_write, read_image, ask_user_question, tool_gateway, rule_load, send_message, web_fetch]
               subagentCompactionTools: [bash, read, write, edit, todo_write, read_image, ask_user_question, tool_gateway, rule_load, send_message, web_fetch]
               # keptContextSources 于 2026-09-11 显式设为空，把 system prompt 对齐到 minimal。
@@ -277,7 +288,7 @@
           # search 零命中且查询命中“已直接可见”的工具名时，直接点名让模型改用直呼，
           # 不再给死胡同。描述 1446→1380 字符（-66），action 参数描述逐字未变，
           # ALWAYS SEARCH FIRST 原句保留。换入口 + release URL 绕 ESM 缓存。
-          # 20261031-deadend3：两条来自真实会话 session-example-a 的死胡同修正——
+          # 20261031-deadend3：两条来自真实会话 session-example-b 的死胡同修正——
           #   1) Team 工具在“本回合没列出”时，报 Team-gated 而不是泛泛的 not eligible
           #      （那轮模型被告知去用 list_agents，目录里却没有，只能白试一轮 gateway）；
           #   2) 把 action 当 name 传（name:"search"）时给纠正提示，而不是 Unknown tool。
@@ -285,7 +296,7 @@
           #   （同一会话里 update_goal 连错两次：先 id/phase、再 expected_revision，第三次才成；
           #   预检会把 goal_id/action/revision 一次列全）。oneOf/anyOf/allOf 跳过，避免误杀。
           - id: tool-gateway
-            name: '@local/dsh-agent-preset-lean/tool-gateway-entry-20261103-022a3.mjs'
+            name: '@local/dsh-agent-preset-lean/tool-gateway-entry-20261107-observed3.mjs'
 
           # 20261017-audit-p1：在 tools/execute（pre-execute 之后、defineTool 校验之前）
           #   归一化模型参数：bash 缺 description 时补一行；sandbox_permissions 无有效
@@ -294,7 +305,7 @@
           #   的前导 ~ 展开为 home。10 月对应错误：bash 47+32+16+6、subagent 26+3、
           #   read 9 次 ~ 路径。
           - id: tool-call-normalizer
-            name: '@local/dsh-agent-preset-lean/tool-call-normalizer-entry-20261021-router-fix.mjs'
+            name: '@local/dsh-agent-preset-lean/tool-call-normalizer-entry-20261106-fixes.mjs'
 
           # 20261102-observation：给每次工具结果**追加**一行结构化观测
           #   [观测] 状态=… 摘要=… 产物=… 下一步=…
@@ -506,7 +517,7 @@
           # 20260924-failed-compaction：只有真实检查点才重新注入核心、重列已加载专项；
           # 失败压缩曾让核心块重复下发（实测多余 41 次 × 1,306 字符）。
           - id: rule-search
-            name: '@local/dsh-agent-preset-lean/rules-hybrid-entry-20260924-failed-compaction.mjs'
+            name: '@local/dsh-agent-preset-lean/rules-hybrid-entry-20261106-fixes.mjs'
 
           # ── on-demand tool discovery ────────────────────────────────────────────────
 
@@ -658,7 +669,7 @@
                   maxTokens: 65536
                   retainRatio: 0.16
                   # ── 摘要模型固定（2026-10-02）──────────────────────────────────
-                  # 现象：会话 session-example-b「无法压缩、无法对话」——每个 turn 的
+                  # 现象：会话 session-example-c「无法压缩、无法对话」——每个 turn 的
                   # pre-step 压力压缩先跑 2 次摘要（compactionRetries 默认 1），两次都
                   # 失败，单步阻塞约 5–10 分钟；手动 /compact 同样以摘要失败收场。
                   # 根因（实测，非推断）：摘要默认跟随"最近一次已路由请求"的
@@ -693,7 +704,7 @@
               # 静默退回 0.6＝1M 窗口要涨到 60 万才压缩。本插件在运行时读
               # tokenMeter + llm 解析出的真实窗口，按固定阈值改写该路由的策略。
               - id: compaction-absolute-threshold
-                name: '@local/dsh-agent-preset-lean/compaction-absolute-threshold-entry-20260924-400k.mjs'
+                name: '@local/dsh-agent-preset-lean/compaction-absolute-threshold-entry-20261106-fixes.mjs'
                 config:
                   thresholdTokens: 400000
                   retainTokens: 80000

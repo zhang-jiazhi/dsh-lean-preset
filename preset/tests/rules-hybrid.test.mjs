@@ -58,6 +58,25 @@ test('version data never rides the bounded notice summary', async t => {
   assert.match(loaded.text, /^Loaded/)
 })
 
+test('rule_load refreshCore re-injects the updated core once', async t => {
+  const f = await fixture(t)
+  const a = f.agent()
+  const first = await f.pre(a)
+  f.commit(a, first.messages)
+  assert.deepEqual((await f.pre(a)).messages, [])
+  await f.set(sample.replace('CORE_V1', 'CORE_V2'))
+  const loaded = await f.tools.get('rule_load').execute({ sections: ['0'], refreshCore: true }, { agent: a })
+  assert.match(loaded.text, /re-injected/)
+  assert.equal(a.inbox.nextStep.length, 1)
+  assert.match(textOf(a.inbox.nextStep), /CORE_V2/)
+  assert.equal(meta(a.inbox.nextStep[0]).kind, 'core')
+  // The explicit refresh is one-shot: an ordinary rule_load still does not
+  // resend the core block, so the per-step cost is unchanged.
+  const second = await f.tools.get('rule_load').execute({ sections: ['0'] }, { agent: a })
+  assert.match(second.text, /pass refreshCore:true/)
+  assert.equal(a.inbox.nextStep.length, 1)
+})
+
 test('parser separates applicability metadata and ignores headings inside fences', () => {
   const parsed = parseRules(sample + '\n```md\n## 99. Example\n```\n')
   assert.equal(parsed.length, 6)

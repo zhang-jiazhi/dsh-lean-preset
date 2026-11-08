@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { apply as bootstrap } from '../tool-bootstrap.mjs'
 import { apply as gateway } from '../tool-gateway.mjs'
-import { isGatewayEligible, originalWhenFor } from '../gateway-policy.mjs?release=20261029-gateway3'
+import { isGatewayEligible, originalWhenFor } from '../gateway-policy.mjs?release=20261106-fixes'
 import { runtime } from './runtime-helper.mjs'
 
 const { Session, SESSION_FORMAT_VERSION } = await runtime('@deepseek-ai/dsh-session')
@@ -58,7 +58,10 @@ test('a pre-registered scoped browser tool becomes gateway-eligible but stays ou
   })
   hooks.get('session/event')?.(session, { type: 'agent/inbox/spliced' })
   hooks.get('session/event')?.(session, { type: 'turn/end' })
-  assert.equal(isGatewayEligible(definition), true)
+  // Eligibility is per calling Agent: this registration is hidden from the
+  // lean agent, so that agent's gateway may serve it.
+  assert.equal(isGatewayEligible(definition, agent), true)
+  assert.equal(isGatewayEligible(definition), false)
   assert.equal(originalWhenFor(definition), undefined)
   gateway({ tools })
   const listed = await gatewayTool.execute({ action: 'search', query: 'browser_click' }, { agent })

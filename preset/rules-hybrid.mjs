@@ -305,12 +305,21 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'rule_load',
-    description: 'Load up to three task-relevant global rule sections by number or title. Core section 0 is automatic. Unchanged delivered or pending versions are reused; changed content can reload. Rules remain below system, developer, direct user instructions and more-specific project rules.',
-    parameters: { type: 'object', properties: { sections: { type: 'array', items: { type: 'string' }, description: 'Topic numbers or titles from the automatic index.' } }, required: ['sections'], additionalProperties: false },
+    description: 'Load up to three task-relevant global rule sections by number or title. Core section 0 is automatic; pass refreshCore:true to re-inject it after editing the rules file. Unchanged delivered or pending versions are reused; changed content can reload. Rules remain below system, developer, direct user instructions and more-specific project rules.',
+    parameters: {
+      type: 'object',
+      properties: {
+        sections: { type: 'array', items: { type: 'string' }, description: 'Topic numbers or titles from the automatic index.' },
+        refreshCore: { type: 'boolean', description: 'Re-inject core section 0 for the next request even if it was already delivered. Use after editing the rules file; it is a one-shot explicit refresh, not a per-step resend.' },
+      },
+      required: ['sections'],
+      additionalProperties: false,
+    },
     output,
     async execute(args, exec) {
       const agent = exec?.agent
       if (!agent?.session || !agent.inbox) return { text: 'rule_load requires an agent context.' }
+      const refreshCore = args.refreshCore === true
       const wanted = Array.isArray(args.sections) ? args.sections.filter(item => typeof item === 'string' && item.trim()).map(item => item.trim()) : []
       if (!wanted.length) return { text: 'rule_load requires sections (numbers or title keywords).' }
       try {
@@ -336,7 +345,19 @@ export function apply(ctx, config = {}) {
         const lines = []
         if (loading.length) lines.push(`Loaded for the next request: ${loading.map(section => section.title).join(', ')}.`)
         if (skipped.length) lines.push(`Already loaded unchanged (delivered or pending): ${skipped.map(section => section.title).join(', ')}.`)
-        if (core.length) lines.push('Core section 0 is loaded automatically; no manual injection was added.')
+        if (core.length && refreshCore) {
+          // Explicit, one-shot refresh: the core block is NOT re-sent every
+          // step, but a user/agent can ask for the current file content after an
+          // edit without waiting for a new session or a compaction.
+          const text = [
+            `全局核心规则已按显式请求刷新，来源：${file}；本节替代本会话先前注入的核心块。`,
+            heading(core[0]),
+          ].join('\n\n')
+          agent.inbox.append('next-step', message(file, 'core', text, [{ number: 0, digest: core[0].digest }], digest(text)))
+          lines.push('Core section 0 was re-injected for the next request.')
+        } else if (core.length) {
+          lines.push('Core section 0 is loaded automatically; pass refreshCore:true to re-inject it after an edit.')
+        }
         if (pending.length > MAX_LOAD_SECTIONS) lines.push(`Exceeds the ${MAX_LOAD_SECTIONS}-section limit, not loaded: ${pending.slice(MAX_LOAD_SECTIONS).map(section => section.title).join(', ')}.`)
         if (unmatched.length) lines.push(`No rule section matches: ${unmatched.join(', ')}.`)
         return { text: lines.join('\n') || 'Nothing to load.' }

@@ -95,9 +95,14 @@ const positiveInt = (value, fallback) => (Number.isSafeInteger(value) && value >
  * completion reservation), well under the 200k budget, so it is left exactly as
  * it was measured.
  *
- * @param {{ thresholdTokens: number, retainTokens: number, minWindowTokens: number, baseThresholdRatio: number, baseHeadroomTokens: number }} options - resolved config.
+ * `base` must be the route's EFFECTIVE policy (its own exact entry merged over
+ * the global config). Passing the global ratio would ignore a route that already
+ * ticks lower than the budget and raise it to the plugin's ratio.
+ *
+ * @param {{ thresholdTokens: number, retainTokens: number, minWindowTokens: number }} options - resolved config.
  * @param {number} contextWindow - the route's live context window.
  * @param {number} reservedTokens - completion tokens this route's request reserves.
+ * @param {{ thresholdRatio?: number, headroomTokens?: number }} base - effective route policy.
  * @returns {{ thresholdRatio: number, retainTokens: number } | undefined} policy override.
  */
 export function policyFor(options, contextWindow, reservedTokens, base = {}) {
@@ -129,8 +134,19 @@ export function apply(ctx, config = {}) {
   const options = { thresholdTokens, retainTokens, minWindowTokens }
   /** Resolved window per `${provider}/${model}`, so the lookup runs once per route. */
   const windows = new Map()
-  /** Last ratio written per route, so an unchanged decision does not churn the config array. */
+  /** Last fields written per route, so an unchanged decision does not churn the config array. */
   const applied = new Map()
+  /**
+   * Per-route snapshot of the fields this plugin may write, taken BEFORE the
+   * first rewrite. `existed` is false when the route had no exact policy.
+   *
+   * Reverting is FIELD-LEVEL, not a whole-entry restore: an external change to
+   * the summarization route (or any other field we do not own) made while the
+   * plugin is active must survive both the "no longer needs tuning" revert and
+   * plugin disposal. A field is restored only while its current value still
+   * equals the value this plugin wrote.
+   */
+  const originals = new Map()
 
   /** The routed provider/model of this agent's latest durable request. */
   const targetOf = (agent) => {
@@ -167,6 +183,9 @@ export function apply(ctx, config = {}) {
     ctx.effect(() => {
       engine[method] = replacement
       return () => {
+        // The policy edits live in `engine.config`, not in the method wrapper,
+        // so unloading must undo them explicitly.
+        restorePolicies()
         if (engine[method] !== replacement) return
         if (descriptor) Object.defineProperty(engine, method, descriptor)
         else delete engine[method]
@@ -182,6 +201,15 @@ export function apply(ctx, config = {}) {
    * Recomputed every step (the window lookup is cached per route, the arithmetic
    * is free) because a route's reserved completion tokens can change between
    * requests: a request that reserves more leaves less room for the budget.
+   *
+   * The entry this plugin writes is a MERGE over the route's original exact
+   * policy: only `thresholdRatio` and `retainTokens` are ours, and `retainRatio`
+   * is dropped because the engine rejects an entry carrying both retention
+   * forms. Everything else (summarizationProvider/Model, headroomTokens,
+   * maxTokens, retries) is preserved. The "only lower" comparison uses the
+   * route's EFFECTIVE ratio, not the global one: a route already ticking at
+   * 0.2 must not be raised to the plugin's ratio just because the global
+   * default is higher.
    */
   const retune = async (agent, signal) => {
     const existing = engine.config.modelPolicies
@@ -190,28 +218,124 @@ export function apply(ctx, config = {}) {
     if (target === undefined) return
     const window = await windowFor(target, signal)
     if (window === undefined) return
+    const key = `${target.provider}\u0000${target.model}`
+    const sameRoute = (entry) => entry?.provider === target.provider && entry?.model === target.model
+    const current = existing.find(sameRoute)
+    if (!originals.has(key)) {
+      originals.set(key, {
+        existed: current !== undefined,
+        thresholdRatio: current?.thresholdRatio,
+        retainTokens: current?.retainTokens,
+        retainRatio: current?.retainRatio,
+        headroomTokens: current?.headroomTokens,
+      })
+    }
+    const original = originals.get(key)
+    const last = applied.get(key)
+    // If the route's threshold no longer equals what this plugin wrote, an
+    // external change owns it now: use the live value as the "only lower" base.
+    const liveRatio = Number.isFinite(current?.thresholdRatio) && current.thresholdRatio > 0
+      && (last === undefined || current.thresholdRatio !== last.thresholdRatio)
+      ? current.thresholdRatio
+      : undefined
+    const originalRatio = Number.isFinite(original.thresholdRatio) && original.thresholdRatio > 0
+      ? original.thresholdRatio
+      : undefined
     const base = {
-      thresholdRatio: engine.config.thresholdRatio,
-      headroomTokens: engine.config.headroomTokens,
+      thresholdRatio: liveRatio ?? originalRatio ?? engine.config.thresholdRatio,
+      headroomTokens: Number.isSafeInteger(current?.headroomTokens) && current.headroomTokens >= 0
+        ? current.headroomTokens
+        : Number.isSafeInteger(original.headroomTokens) && original.headroomTokens >= 0
+          ? original.headroomTokens
+          : engine.config.headroomTokens,
     }
     const policy = policyFor(options, window, target.maxTokens, base)
-    const key = `${target.provider}\u0000${target.model}`
     if (policy === undefined) {
-      // The route keeps its own trigger; drop any stale override for it.
-      if (!applied.has(key)) return
-      applied.delete(key)
-      engine.config = { ...engine.config, modelPolicies: existing.filter((entry) => entry.provider !== target.provider || entry.model !== target.model) }
+      // The route's own effective trigger is already at or below the budget.
+      // Nothing was written → leave it alone; otherwise undo only our fields.
+      if (!applied.has(key)) {
+        originals.delete(key)
+        return
+      }
+      undoRoute(key)
       return
     }
-    if (applied.get(key) === policy.thresholdRatio) return
-    applied.set(key, policy.thresholdRatio)
-    engine.config = {
-      ...engine.config,
-      modelPolicies: [
-        { provider: target.provider, model: target.model, ...policy },
-        ...existing.filter((entry) => entry.provider !== target.provider || entry.model !== target.model),
-      ],
+    if (last !== undefined && last.thresholdRatio === policy.thresholdRatio && last.retainTokens === policy.retainTokens) return
+    // Merge over the CURRENT entry, not the stale snapshot: external edits to
+    // summarization/retries made since the plugin wrote are preserved.
+    const next = {
+      ...(current ?? {}),
+      provider: target.provider,
+      model: target.model,
+      thresholdRatio: policy.thresholdRatio,
+      retainTokens: policy.retainTokens,
     }
+    delete next.retainRatio
+    applied.set(key, { thresholdRatio: next.thresholdRatio, retainTokens: next.retainTokens })
+    const modelPolicies = []
+    let placed = false
+    for (const entry of existing) {
+      if (!placed && sameRoute(entry)) {
+        modelPolicies.push(next)
+        placed = true
+      } else {
+        modelPolicies.push(entry)
+      }
+    }
+    if (!placed) modelPolicies.unshift(next)
+    engine.config = { ...engine.config, modelPolicies }
+  }
+
+  /**
+   * Undo the fields this plugin still owns for one route. A field changed by a
+   * later external edit is left alone; other external fields are always kept.
+   */
+  const undoRoute = (key) => {
+    const last = applied.get(key)
+    if (last === undefined) return
+    const existing = engine.config.modelPolicies
+    if (!Array.isArray(existing)) {
+      applied.delete(key)
+      originals.delete(key)
+      return
+    }
+    const separator = key.indexOf('\u0000')
+    const provider = key.slice(0, separator)
+    const model = key.slice(separator + 1)
+    const index = existing.findIndex((entry) => entry?.provider === provider && entry?.model === model)
+    const original = originals.get(key) ?? {}
+    applied.delete(key)
+    originals.delete(key)
+    // The route entry was removed externally; our fields went with it.
+    if (index < 0) return
+    const current = existing[index]
+    const next = { ...current }
+    let owned = false
+    if (current.thresholdRatio === last.thresholdRatio) {
+      if (original.thresholdRatio === undefined) delete next.thresholdRatio
+      else next.thresholdRatio = original.thresholdRatio
+      owned = true
+    }
+    if (current.retainTokens === last.retainTokens) {
+      delete next.retainTokens
+      if (original.retainTokens !== undefined) next.retainTokens = original.retainTokens
+      else if (original.retainRatio !== undefined) next.retainRatio = original.retainRatio
+      owned = true
+    }
+    // Every field we wrote was replaced externally: keep the external entry.
+    if (!owned) return
+    const copy = existing.slice()
+    const remaining = Object.keys(next).filter((field) => field !== 'provider' && field !== 'model')
+    if (!original.existed && remaining.length === 0) copy.splice(index, 1)
+    else copy[index] = next
+    engine.config = { ...engine.config, modelPolicies: copy }
+  }
+
+  /** Undo every field this plugin still owns (used on disposal). */
+  const restorePolicies = () => {
+    for (const key of [...applied.keys()]) undoRoute(key)
+    applied.clear()
+    originals.clear()
   }
 
   replace('compactIfNeeded', original => async (agent, trigger, signal) => {
