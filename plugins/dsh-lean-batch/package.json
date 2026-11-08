@@ -1,0 +1,23 @@
+{
+  "name": "@local/dsh-lean-batch",
+  "version": "0.1.0",
+  "description": "LEAN preset's optional batch tool: run one program that calls this session's visible tools through a generated binding, so intermediate results stay out of the conversation. Takes PTC's mechanism without PTC's presentation mode or its always-resident SDK text.",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
+    "@deepseek-ai/dsh-ptc-runtime": ">=0.0.1-rc <2"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

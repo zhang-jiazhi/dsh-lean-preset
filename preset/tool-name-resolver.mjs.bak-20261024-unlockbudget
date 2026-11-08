@@ -1,0 +1,116 @@
+/**
+ * Resolve case-sensitive unlocks identically in discovery and assembly.
+ *
+ * 20260930-recall: auto-resolution moved HERE from the discovery tool.
+ * It used to live only in dev-tool-search.mjs, which meant discovery could
+ * announce an unlock that tool-bootstrap.mjs (the actual assembly) would never
+ * grant — the two sides resolve from this same module precisely to avoid that
+ * class of lie. Anything that decides "this name resolves" must be shared.
+ */
+
+/** Dice coefficient over character bigrams — catches transpositions
+ *  (memory_serach → memory_search) that exact-part matching misses. */
+const bigramDice = (a, b) => {
+  const bigrams = (s) => {
+    const set = new Set()
+    for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2))
+    return set
+  }
+  const sa = bigrams(a.toLowerCase())
+  const sb = bigrams(b.toLowerCase())
+  if (sa.size === 0 || sb.size === 0) return 0
+  let shared = 0
+  for (const gram of sa) if (sb.has(gram)) shared += 1
+  return (2 * shared) / (sa.size + sb.size)
+}
+
+const nameParts = (value) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+
+/**
+ * Resolve a name the model guessed but that is not in the catalog.
+ *
+ * Returns null whenever the choice is not clearly unambiguous — a wrong pick
+ * costs more than a suggestion round (an MCP family can contain both read and
+ * write variants). Rules:
+ *   · non-MCP: unique prefix (exa → exa_search), or a similarity that clearly
+ *     leads (absolute gap ≥0.08, relative ≥1.15, or a very high 0.75);
+ *   · MCP: only when ≥2 distinguishing words are shared and the leader is
+ *     strictly ahead — a single shared generic word ("issue") must NOT pick a
+ *     tool, or a typo could silently select a write-side tool;
+ *   · never for wildcards.
+ */
+export function autoResolveName(missing, catalogNames) {
+  if (typeof missing !== 'string' || missing.length === 0) return null
+  if (missing.endsWith('*')) return null
+
+  if (missing.startsWith('mcp__')) {
+    const segments = missing.split('__')
+    if (segments.length < 3) return null
+    const family = catalogNames.filter((candidate) => candidate.startsWith(`mcp__${segments[1]}__`))
+    const wanted = new Set(nameParts(segments.slice(2).join('_')))
+    const scored = family
+      .map((candidate) => ({
+        candidate,
+        overlap: nameParts(candidate.split('__').slice(2).join('_')).filter((part) => wanted.has(part)).length,
+      }))
+      .filter((entry) => entry.overlap > 0)
+      .sort((a, b) => b.overlap - a.overlap || a.candidate.localeCompare(b.candidate))
+    if (scored.length === 0) return null
+    if (scored[0].overlap < 2) return null
+    if (scored.length === 1) return { name: scored[0].candidate, reason: '族内共享词' }
+    if (scored[0].overlap > scored[1].overlap) return { name: scored[0].candidate, reason: '族内共享词最多' }
+    return null
+  }
+
+  const others = catalogNames.filter((candidate) => !candidate.startsWith('mcp__') && candidate !== missing)
+  const prefixed = others.filter((candidate) => candidate.startsWith(missing))
+  if (prefixed.length === 1) return { name: prefixed[0], reason: '唯一前缀' }
+  const scored = others
+    .map((candidate) => ({ candidate, dice: bigramDice(missing, candidate) }))
+    .sort((a, b) => b.dice - a.dice || a.candidate.localeCompare(b.candidate))
+  const best = scored[0]
+  const second = scored[1]
+  if (best === undefined || best.dice < 0.6) return null
+  if (second === undefined) return { name: best.candidate, reason: '唯一候选' }
+  const absolute = best.dice - second.dice
+  const relative = second.dice === 0 ? Infinity : best.dice / second.dice
+  if (absolute >= 0.08 || relative >= 1.15 || best.dice >= 0.75) {
+    return { name: best.candidate, reason: '最接近' }
+  }
+  return null
+}
+
+/** Resolve unlock names against the real catalog, in one shared place. */
+export function resolveToolNames(rawNames, catalogNames) {
+  const available = new Set(catalogNames)
+  const resolved = new Set()
+  const missing = new Set()
+  const autoResolved = []
+  for (const raw of rawNames) {
+    if (typeof raw !== 'string' || raw.length === 0) continue
+    // Exact catalog members win even when their name resembles an MCP group.
+    if (available.has(raw)) {
+      resolved.add(raw)
+      continue
+    }
+    let prefix
+    if (raw.endsWith('*')) prefix = raw.slice(0, -1)
+    // A complete MCP name has another "__" delimiter, not a bare server name.
+    else if (/^mcp__[A-Za-z0-9_-]+$/.test(raw) && !raw.slice(5).includes('__')) prefix = `${raw}__`
+    const hits = prefix === undefined ? [] : [...available].filter(name => name.startsWith(prefix))
+    if (hits.length > 0) {
+      for (const name of hits) resolved.add(name)
+      continue
+    }
+    // 20260930-recall: not resolvable as written — try an unambiguous near-miss
+    // in THIS module so discovery and assembly always agree on the outcome.
+    const auto = autoResolveName(raw, catalogNames)
+    if (auto !== null) {
+      resolved.add(auto.name)
+      autoResolved.push({ from: raw, to: auto.name, reason: auto.reason })
+      continue
+    }
+    missing.add(raw)
+  }
+  return { resolved: [...resolved], missing: [...missing], autoResolved }
+}

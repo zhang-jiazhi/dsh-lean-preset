@@ -1,0 +1,517 @@
+/**
+ * Stable single-entry capability gateway for the LEAN preset (2026-10-29).
+ *
+ * The model sees one `tool_gateway` schema plus the fixed resident core. Every
+ * on-demand tool (MCP/browser/skill/memory/subagent/…) is hidden from
+ * `request.tools`, so unlocking a capability no longer changes the request
+ * prefix. The gateway resolves a private catalog and delegates through the
+ * public `ctx.tools.execute()` pipeline, preserving pre-execute policy,
+ * approval, guards and post-execute handling.
+ *
+ * Deliberately dependency-free: preset-local modules can only resolve relative
+ * files, so the definition is hand-built instead of importing `defineTool`.
+ */
+
+export const name = 'tool-gateway'
+
+/** The tool registry must exist before this tool can register. */
+export const inject = ['tools']
+
+import { isGatewayEligible, originalWhenFor } from './gateway-policy.mjs?release=20261029-gateway3'
+
+const GATEWAY_NAME = 'tool_gateway'
+const MAX_LIST = 80
+const MAX_SEARCH = 25
+const MAX_LIST_CHARS = 5000
+const MAX_SEARCH_CHARS = 3000
+const MAX_DESCRIPTION = 180
+/** Lean-local on-demand skills stay out of resident tools but remain gateway-reachable. */
+const GATEWAY_ALWAYS = new Set(['skill_search', 'skill_load'])
+
+const textOf = (value) => (typeof value === 'string' ? value : '')
+
+const clip = (value, limit = MAX_DESCRIPTION) => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length <= limit ? text : `${text.slice(0, limit - 3)}...`
+}
+
+/** Build the private catalog: global registrations plus this agent's scoped ones. */
+const catalogFor = (ctx, agent) => {
+  const definitions = new Map()
+  const direct = new Set()
+  const conditional = new Set()
+  const add = (entries) => {
+    for (const [name, definition] of entries) {
+      if (name === GATEWAY_NAME) continue
+      if (!isGatewayEligible(definition) && !GATEWAY_ALWAYS.has(name)) {
+        direct.add(name)
+        continue
+      }
+      // A definition with its own `when` stays out: no step modelSelection here.
+      // Remember the name so a search/describe can explain the exclusion
+      // instead of dead-ending on "no match" (e.g. web_search).
+      if (originalWhenFor(definition) !== undefined) {
+        conditional.add(name)
+        continue
+      }
+      definitions.set(name, definition)
+    }
+  }
+  add(ctx.tools.view().visible)
+  if (agent !== undefined && agent !== null) add(ctx.tools.view(agent).visible)
+  return { definitions, direct, conditional }
+}
+
+/** A step-like tool set accepted by ctx.tools.execute(). */
+const privateToolSet = (definitions, agent) => ({
+  dispose() {},
+  view(scope) {
+    return scope === agent ? definitions : new Map()
+  },
+})
+
+/** Preserve the hidden tool's canonical content, including image/file blocks. */
+const resultValue = (settled) => {
+  const result = settled?.results?.[0]?.result
+  if (result === undefined) throw new Error('tool produced no result')
+  const content = Array.isArray(result.content) ? result.content : undefined
+  const text = (content ?? [])
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n')
+  if (result.isError === true) {
+    throw new Error(textOf(result.error?.message) || text || 'tool failed')
+  }
+  if (content !== undefined && content.length > 0) return { content, ...(text.length > 0 ? { text } : {}) }
+  if (result.value !== undefined) return { text: JSON.stringify(result.value, null, 2) }
+  return { text: '(tool completed with no output)' }
+}
+
+/**
+ * Batch form of `action="call"` (2026-11-01, from dsh-superagent's
+ * `orchestrator_route`, which takes 1–20 decisions in one call): one gateway
+ * call runs several hidden tools in order and labels each result. Valid names
+ * and inputs are the caller's job — validation happens before anything runs,
+ * so a typo in the second item never leaves the first executed.
+ */
+const batchResult = (settled, names) => {
+  const results = Array.isArray(settled?.results) ? settled.results : []
+  const sections = []
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index]
+    const result = results[index]?.result
+    const text = (Array.isArray(result?.content) ? result.content : [])
+      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')
+    const body = result?.isError === true
+      ? `ERROR: ${textOf(result.error?.message) || text || 'tool failed'}`
+      : (text || (result?.value !== undefined ? JSON.stringify(result.value) : '(no output)'))
+    sections.push(`## ${name}\n${body}`)
+  }
+  return { text: sections.join('\n\n') }
+}
+
+const collectLines = (entries, limit, budget) => {
+  const lines = []
+  let chars = 0
+  for (const [toolName, definition] of entries) {
+    if (lines.length >= limit) break
+    const line = `- ${toolName}: ${clip(definition?.description)}`
+    if (lines.length > 0 && chars + line.length > budget) break
+    lines.push(line)
+    chars += line.length + 1
+  }
+  return { lines, shown: lines.length, omitted: Math.max(0, entries.length - lines.length) }
+}
+
+/** Paged listing: the char budget alone must never make the catalog unreachable. */
+const listText = (definitions, offset = 0) => {
+  const entries = [...definitions.entries()].sort(([a], [b]) => a.localeCompare(b))
+  const total = entries.length
+  if (total === 0) return 'No gateway-eligible tools registered.'
+  const start = Math.min(Math.max(0, Math.trunc(offset) || 0), total)
+  // An offset past the end must not print "278-277 of 277".
+  if (start === total && total > 0) return `End of list: ${total} gateway tools. Call list without offset to start over.`
+  const { lines, shown } = collectLines(entries.slice(start), MAX_LIST, MAX_LIST_CHARS)
+  const end = start + shown
+  const out = [`gateway tools ${start + 1}-${end} of ${total}`]
+  out.push(...lines)
+  if (end < total) out.push(`... (${total - end} more; call list with offset=${end})`)
+  return out.join('\n')
+}
+
+/** Score one tool for a set of terms. Any term may match; name hits weigh most. */
+const scoreTool = (toolName, definition, terms) => {
+  const name = toolName.toLowerCase()
+  const description = String(definition?.description ?? '').toLowerCase()
+  let score = 0
+  for (const term of terms) {
+    const inName = name.includes(term)
+    if (inName) {
+      score += 3
+      if (name === term) score += 6
+      continue
+    }
+    if (description.includes(term)) score += 1
+  }
+  return score
+}
+
+/** Split a query into alternative term groups: commas separate, spaces hold one concept. */
+const queryGroups = (query) =>
+  query.toLowerCase().split(',').map(group => group.split(/\s+/).filter(Boolean)).filter(group => group.length > 0)
+
+/**
+ * Directly visible tools a zero-result query was reaching for. Observed real
+ * sessions searched for resident/Team tools (`list_agents`, `send_message`,
+ * `team agents`) that the gateway can never serve, then abandoned the gateway
+ * entirely; naming them turns that dead end into one direct call.
+ */
+const directHitsFor = (direct, groups) => {
+  const hits = new Set()
+  for (const terms of groups) {
+    for (const term of terms) {
+      if (direct.has(term)) {
+        hits.add(term)
+        continue
+      }
+      for (const name of direct) {
+        if (name.startsWith(`${term}_`) || (term.length >= 4 && name.includes(term))) hits.add(name)
+      }
+    }
+  }
+  return [...hits].sort()
+}
+
+/** Conditional names that the query was reaching for (`web_search`, …). */
+const conditionalHitsFor = (conditional, groups) => {
+  const terms = groups.flat()
+  return [...conditional].filter(name => {
+    const lower = name.toLowerCase()
+    return terms.some(term => lower.includes(term))
+  }).sort().slice(0, 3)
+}
+
+/** A failed search still has to end in an executable next step; list is the fallback. */
+const noMatchText = (direct, query, groups, conditional = new Set()) => {
+  const gated = conditionalHitsFor(conditional, groups)
+  if (gated.length > 0) {
+    const names = gated.map(name => `"${name}"`).join(', ')
+    const verb = gated.length === 1 ? 'is' : 'are'
+    return `No gateway-eligible tools match "${query}". ${names} ${verb} conditionally registered and cannot be called through the gateway — ${gated.length === 1 ? 'it appears' : 'they appear'} in your tool list only when ${gated.length === 1 ? 'its' : 'their'} condition holds.`
+  }
+  const hits = directHitsFor(direct, groups)
+  if (hits.length === 0) return `No gateway-eligible tools match "${query}". Try list.`
+  const shown = hits.slice(0, 6).join(', ')
+  const rest = hits.length > 6 ? ` (+${hits.length - 6} more)` : ''
+  const verb = hits.length === 1 ? 'is' : 'are'
+  return `No gateway-eligible tools match "${query}". ${shown}${rest} ${verb} already visible in your tool list — call ${hits.length === 1 ? 'it' : 'them'} directly instead of using the gateway.`
+}
+
+/** Prefer all-term matches for phrases, while keeping OR fallback for name lists. */
+const searchText = (definitions, query, direct, conditional = new Set()) => {
+  const groups = queryGroups(query)
+  const selected = new Map()
+  for (const terms of groups) {
+    const matches = []
+    const strict = []
+    const nameMatches = []
+    for (const [toolName, definition] of definitions.entries()) {
+      const score = scoreTool(toolName, definition, terms)
+      if (score === 0) continue
+      const name = toolName.toLowerCase()
+      const description = String(definition?.description ?? '').toLowerCase()
+      const allNameTermsMatch = terms.every(term => name.includes(term))
+      const allTermsMatch = allNameTermsMatch || terms.every(term => description.includes(term) || name.includes(term))
+      const item = { toolName, definition, score }
+      matches.push(item)
+      if (allTermsMatch) strict.push(item)
+      if (allNameTermsMatch) nameMatches.push(item)
+    }
+    // If the query names tools directly, do not include other tools whose
+    // descriptions merely mention those names (for example memory_get mentions
+    // memory_list in its own usage guidance).
+    const preferred = nameMatches.length > 0 ? nameMatches : strict.length > 0 ? strict : matches
+    for (const item of preferred) {
+      const previous = selected.get(item.toolName)
+      if (previous === undefined || item.score > previous.score) selected.set(item.toolName, item)
+    }
+    // One incidental all-term description match must not hide real name matches:
+    // "web search" listed only deepseek_fetch (description mentions both words)
+    // while tavily_search / anysearch_search fell out (observed 2026-11-01).
+    if (nameMatches.length === 0 && strict.length > 0 && strict.length < 3) {
+      for (const item of matches) {
+        if (item.score < 3) continue
+        const previous = selected.get(item.toolName)
+        if (previous === undefined || item.score > previous.score) selected.set(item.toolName, item)
+      }
+    }
+  }
+  if (selected.size === 0) return noMatchText(direct, query, groups, conditional)
+  const scored = [...selected.values()]
+  scored.sort((a, b) => b.score - a.score || a.toolName.localeCompare(b.toolName))
+  const entries = scored.map(item => [item.toolName, item.definition])
+  const { lines, omitted } = collectLines(entries, MAX_SEARCH, MAX_SEARCH_CHARS)
+  if (omitted > 0) lines.push(`... (+${omitted} more; narrow the query)`)
+  return lines.join('\n')
+}
+
+/** Nearest registered names for a mistyped/absent one, so recovery is one call. */
+const suggestionsFor = (definitions, toolName) => {
+  const terms = String(toolName).toLowerCase().split(/[^a-z0-9]+/).filter(term => term.length > 1)
+  if (terms.length === 0) return ''
+  const scored = []
+  for (const [name, definition] of definitions.entries()) {
+    const tokens = name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+    const lower = name.toLowerCase()
+    let score = 0
+    for (const term of terms) {
+      if (tokens.includes(term)) score += 4
+      else if (tokens.some(token => token.length >= 3 && term.startsWith(token))) score += 2
+      else if (lower.includes(term)) score += 1
+    }
+    if (score === 0) score = scoreTool(name, definition, terms)
+    if (score > 0) scored.push([name, score])
+  }
+  scored.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  return scored.slice(0, 3).map(([name]) => name).join(', ')
+}
+
+/** Actions themselves, so `name:"search"` gets a corrective hint instead of "unknown tool". */
+const GATEWAY_ACTIONS = new Set(['search', 'describe', 'call', 'list'])
+
+/**
+ * Team tools are gated by session arming, not by the gateway catalog. Naming
+ * them as "not gateway tools" without that condition sent a real Team Lead
+ * session (2026-10-31, session-example-a) into a dead end: the tools were absent
+ * from its catalog, the model tried `tool_gateway call list_agents`, and the
+ * generic message told it "if it is visible, call it directly".
+ */
+const TEAM_TOOLS = new Set([
+  'spawn_teammate',
+  'team_task_create',
+  'team_task_list',
+  'team_task_get',
+  'team_task_update',
+  'wait_agent',
+  'send_message',
+  'list_agents',
+  'interrupt_agent',
+])
+
+// The gateway can see registrations, not the caller's resolved catalog, so the
+// wording stays conditional: "direct" here means "registered and not
+// gateway-eligible", which is not the same as "listed for this turn" (a Team
+// tool is registered even when the session never armed Team mode).
+const directToolText = (toolName) => (TEAM_TOOLS.has(toolName)
+  ? `"${toolName}" is a Team tool, not a gateway tool. Team tools are listed only when this session is a Team session (the user asked for the Agent Team, or this session is the Team Lead); if it is not in your tool list right now, say so instead of using the gateway.`
+  : `"${toolName}" is not gateway-eligible. If it is visible in your tool list, call it directly; otherwise it is unavailable.`)
+
+const actionNameText = (toolName) => `"${toolName}" is a gateway action, not a tool name. Use action="${toolName}"${toolName === 'search' ? ' with a query' : toolName === 'call' ? ' with name and input' : ''} instead of passing it as name.`
+
+/**
+ * Top-level `required` properties the given input does not carry.
+ * Union schemas (`oneOf`/`anyOf`/`allOf`) are skipped: their required sets are
+ * conditional, and a false rejection would be worse than the generic error.
+ */
+const missingRequiredProperties = (schema, input) => {
+  if (schema === null || typeof schema !== 'object') return []
+  if (schema.oneOf !== undefined || schema.anyOf !== undefined || schema.allOf !== undefined) return []
+  if (!Array.isArray(schema.required) || schema.required.length === 0) return []
+  const given = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {}
+  return schema.required.filter(key => given[key] === undefined)
+}
+
+/**
+ * A model sometimes serializes `input` twice and hands over a JSON string.
+ * Parsing it is lossless and turns a wasted round into a working call; a
+ * string that is not a JSON object still fails the normal validation.
+ */
+const normalizeInput = (input) => {
+  if (typeof input !== 'string') return input
+  try {
+    const parsed = JSON.parse(input)
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : input
+  } catch {
+    return input
+  }
+}
+
+const unknownToolText = (definitions, toolName, hint, conditional = new Set()) => {
+  if (conditional.has(toolName)) {
+    return `"${toolName}" is conditionally registered and cannot be called through the gateway — it appears in your tool list only when its condition holds. ${hint}`
+  }
+  const near = suggestionsFor(definitions, toolName)
+  return `Unknown tool "${toolName}".${near ? ` Closest names: ${near}.` : ''} ${hint}`
+}
+
+const definition = (ctx) => ({
+  name: GATEWAY_NAME,
+  description: [
+    '`tool_gateway`: stable gateway for LEAN tools hidden from your tool list; search/call them here.',
+    'NOT gateway tools — searching them only burns a round: your resident tools (bash/read/write/edit/glob/grep/todo_write/rule_load …); Team tools only when this session lists them (list_agents/send_message/spawn_teammate/interrupt_agent/wait_agent/team_task_*); subagent/workflow; goal/job. Call those directly.',
+    'ALWAYS SEARCH FIRST: call action="search" with a short family/keyword query before doing anything else. Do NOT call list first; use list only after search has no useful hit. Spaces join a concept; commas split alternatives. list is paged; follow the offset in its footer.',
+    'If arguments are unknown, use action="describe" with name first, then action="call" with the exact name and input. The call still goes through normal approval and policy.',
+    '',
+    'Family index (approximate; action="list" is authoritative — anything absent is NOT reachable here):',
+    'browser_* sidebar browser; mcp__playwright-mcp__* when unlocked; memory_*; session_* + search_history/history_context;',
+    'terminal_*; search aggregator (tavily_search/anysearch_search/exa_search/deepseek_search/deepseek_fetch/search_provider_status);',
+    'dev_* (plugin build/inject/stage/patch/heal/reload/self-test); create_worktree; cua; apply_patch (one-call multi-file patch); batch; ralph; propose_action;',
+    'skill_search / skill_load (on-demand skills); load_workspace_dependencies; working_directory.',
+  ].join('\n'),
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['search', 'describe', 'call', 'list'],
+        description: 'Discovery first: search. Then describe if the input shape is unknown, then call.',
+      },
+      query: { type: 'string', description: 'Short family/keyword query for search.' },
+      offset: { type: 'integer', minimum: 0, description: 'Paging offset for list (default 0); the footer prints the next offset.' },
+      name: { type: 'string', description: 'Exact gateway-eligible tool name for describe/call.' },
+      input: { type: 'object', additionalProperties: true, description: 'Arguments object for the hidden tool.' },
+      calls: {
+        type: 'array',
+        maxItems: 8,
+        description: 'Batch form of action="call": [{name, input}, …] runs several hidden tools in one step, in order.',
+        items: { type: 'object', properties: { name: { type: 'string' }, input: { type: 'object' } }, required: ['name'] },
+      },
+    },
+    required: ['action'],
+  },
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        text: { type: 'string' },
+        content: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      },
+    },
+    render: (_args, value) => (
+      Array.isArray(value.content) && value.content.length > 0
+        ? value.content
+        : [{ type: 'text', text: value.text ?? '(tool completed with no output)' }]
+    ),
+  },
+  async execute(args, exec) {
+    const action = args?.action ?? (Array.isArray(args?.calls) ? 'call' : undefined)
+    if (Array.isArray(args?.calls) && action !== 'call') {
+      throw new Error('calls only applies to action="call".')
+    }
+    const { definitions, direct, conditional } = catalogFor(ctx, exec?.agent)
+    if (action === 'list') return { text: listText(definitions, args?.offset) }
+    if (action === 'search') {
+      const query = typeof args.query === 'string' ? args.query.trim() : ''
+      if (query.length === 0) throw new Error('Provide a non-empty query for search, or use action="list".')
+      return { text: searchText(definitions, query, direct, conditional) }
+    }
+    if (action === 'describe') {
+      const toolName = typeof args.name === 'string' ? args.name.trim() : ''
+      if (toolName.length === 0) throw new Error('Provide the exact tool name for action="describe".')
+      if (GATEWAY_ACTIONS.has(toolName)) throw new Error(actionNameText(toolName))
+      const target = definitions.get(toolName)
+      if (target === undefined) {
+        if (direct.has(toolName)) throw new Error(directToolText(toolName))
+        if (TEAM_TOOLS.has(toolName)) throw new Error(directToolText(toolName))
+        throw new Error(unknownToolText(definitions, toolName, 'Use action="search" or action="list" first.', conditional))
+      }
+      return {
+        text: JSON.stringify({
+          name: toolName,
+          description: target.description,
+          parameters: target.parameters,
+        }, null, 2),
+      }
+    }
+    if (action !== 'call') throw new Error(`Unknown action: ${String(action)}`)
+
+    if (Array.isArray(args.calls)) return callBatch(args.calls)
+
+    const toolName = typeof args.name === 'string' ? args.name.trim() : ''
+    if (toolName.length === 0) throw new Error('Provide the exact tool name for action="call".')
+    if (toolName === GATEWAY_NAME) throw new Error('tool_gateway cannot call itself.')
+    if (GATEWAY_ACTIONS.has(toolName)) throw new Error(actionNameText(toolName))
+    if (!definitions.has(toolName)) {
+      if (direct.has(toolName)) throw new Error(directToolText(toolName))
+      if (TEAM_TOOLS.has(toolName)) throw new Error(directToolText(toolName))
+      throw new Error(unknownToolText(definitions, toolName, 'Use action="search" or action="list" to find the exact name.', conditional))
+    }
+    const input = normalizeInput(args.input)
+    if (input !== undefined && (input === null || typeof input !== 'object' || Array.isArray(input))) {
+      throw new Error('input must be a JSON object.')
+    }
+    // A hidden tool's schema is invisible until `describe`, so a wrong field
+    // name only surfaces as the executor's generic rejection. Naming every
+    // missing property in one message turns the guess-and-retry loop into one
+    // round: measured in session-example-a, where `update_goal` cost two failed
+    // calls (`id`/`phase`, then `expected_revision`) before the third succeeded.
+    const schema = definitions.get(toolName)?.parameters
+    const missing = missingRequiredProperties(schema, input)
+    if (missing.length > 0) {
+      throw new Error(`invalid arguments for "${toolName}": missing required ${missing.map(key => `"${key}"`).join(', ')}. Required: ${schema.required.join(', ')}. Call action="describe" with name="${toolName}" for the exact schema.`)
+    }
+    const settled = await ctx.tools.execute({
+      calls: [{
+        id: `gateway-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: toolName,
+        arguments: JSON.stringify(input ?? {}),
+      }],
+      agent: exec.agent,
+      signal: exec.signal,
+      toolSet: privateToolSet(definitions, exec.agent),
+    })
+    for (const context of settled.additionalContexts ?? []) exec.deferContext(context)
+    if (settled.concluded === true) exec.concludeTurn()
+    return resultValue(settled)
+
+    /** Validate every item first, then run them as one executor batch. */
+    async function callBatch(items) {
+      if (typeof args.name === 'string' && args.name.trim().length > 0) {
+        throw new Error('Use either name+input or calls, not both.')
+      }
+      if (items.length === 0 || items.length > 8) throw new Error('calls must contain 1–8 items.')
+      const prepared = items.map((item, index) => {
+        const name = typeof item?.name === 'string' ? item.name.trim() : ''
+        if (name.length === 0) throw new Error(`calls[${index}]: provide the exact tool name.`)
+        if (name === GATEWAY_NAME) throw new Error('tool_gateway cannot call itself.')
+        if (GATEWAY_ACTIONS.has(name)) throw new Error(actionNameText(name))
+        if (!definitions.has(name)) {
+          if (direct.has(name) || TEAM_TOOLS.has(name)) throw new Error(directToolText(name))
+          throw new Error(unknownToolText(definitions, name, 'Use action="search" or action="list" to find the exact name.', conditional))
+        }
+        const input = normalizeInput(item?.input)
+        if (input !== undefined && (input === null || typeof input !== 'object' || Array.isArray(input))) {
+          throw new Error(`calls[${index}]: input must be a JSON object.`)
+        }
+        const schema = definitions.get(name)?.parameters
+        const missing = missingRequiredProperties(schema, input)
+        if (missing.length > 0) {
+          throw new Error(`calls[${index}] "${name}": missing required ${missing.map(key => `"${key}"`).join(', ')}. Required: ${schema.required.join(', ')}. Call action="describe" with name="${name}" for the exact schema.`)
+        }
+        return { name, input }
+      })
+      const settled = await ctx.tools.execute({
+        calls: prepared.map((item, index) => ({
+          id: `gateway-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`,
+          name: item.name,
+          arguments: JSON.stringify(item.input ?? {}),
+        })),
+        agent: exec.agent,
+        signal: exec.signal,
+        toolSet: privateToolSet(definitions, exec.agent),
+      })
+      for (const context of settled.additionalContexts ?? []) exec.deferContext(context)
+      if (settled.concluded === true) exec.concludeTurn()
+      return batchResult(settled, prepared.map(item => item.name))
+    }
+  },
+})
+
+/** Register one fixed-schema gateway; the private catalog is resolved per call. */
+export function apply(ctx) {
+  ctx.tools.register(definition(ctx))
+}

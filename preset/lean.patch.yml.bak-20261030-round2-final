@@ -1,0 +1,1040 @@
+# lean 预设（0.1.7 迁移版）：由目录预设迁移为 @deepseek-ai/dsh-agent-preset 声明。
+# 迁移规则：旧 agent.cordis.yml 的顶层条目列表 → config.plugins（整体缩进 +10）；
+# 旧 preset.yml 的 name/description/order → config 同名键；config.id 沿用目录名 lean，
+# 使既有会话按保存的预设身份 resume 不受影响。./xxx.mjs 相对路径以本 bundle 目录解析，保持不变。
+# 原文件备份于 ~/.dsh/backups/lean-preset-pre-0.1.7-20260922-153425/。
+
+# lean 预设：核心规则自动加载，专项与其他工具按需加载。
+#
+# 派生自 anchored-flash（MIT），改动四处：
+#   1. persona = 官方 minimal 单句；提示词完整性由 tool-bootstrap 的 assembly
+#      过滤器保证，不能设置 complete: true，否则 plan:policy 无法在 plan mode 显示。
+#      includeRuntimeContext 保持开启，让过滤器保留策略事实并丢弃 bulk snapshot。
+#   2. 官方全量 agent-instructions 和旧 instruction-hint 保持 disabled；
+#      rules-hybrid 在首次请求前提供核心和专项目录，按内容版本去重。
+#   3. 规则加载入口常驻；其他专项能力统一通过 tool_gateway 按需调用。
+#   4. 去掉了普通 subagent 与 fork 的模型钉死：两者路由与思考等级统一取自
+#      subagent-model-selection 设置的 defaultModel / defaultReasoningEffort，
+#      未配置时回落为继承父会话；另加跨模型 claude-opus 委派入口。
+#
+# 工具策略（全量曝光 vs 按需加载）：
+#   - 首个请求：bash、str_replace_editor、read、rule_load、tool_gateway；顶层目录固定。
+#   - 首次工具调用/首次回复后：目录收敛到 residentTools 白名单。
+#   - 其余工具（skill / 记忆库 / subagent / workflow / goal / 后台任务 / web 搜索 /
+#     上下文压缩 / plan-mode / MCP 等）仍然全部装配、随时可用，但 schema 不进顶层；
+#     模型用 tool_gateway 的 list/search 发现，再用 call 调用。顶层工具集不再随
+#     解锁变化，前缀缓存稳定；调用仍走正常 policy/审批/guards。
+#   - 能力全量在线，仅核心规则、专项目录及少量常驻工具 schema 自动进入上下文。
+#
+# 改完本预设怎样才生效（2026-09-04 查证，2026-09-22 迁移后更正）：
+#   - 本文件（lean.patch.yml）：0.1.7 的 registry 在注册时加载配置，不再使用
+#     旧 ensureStanding/compositionStamp。修改后，通过 pluginManager 的
+#     setBundleEnabled('@local/dsh-agent-preset-lean', true) 重新协调补丁，
+#     无需禁用预设或重启宿主；仅修改磁盘文件不足以证明已激活。
+#   - 已导入的同路径 *.mjs 可能命中 Node ESM 缓存；需重启宿主，或改用新的
+#     入口路径和模块 URL。规则插件通过独立入口与 release URL 提供这一代实现。
+#     后续同路径源码更新不要只依赖 compositionStamp；入口自身也可能已缓存。
+#   - 已在运行的会话不受影响：它绑定的是创建时那一份 standing composition。
+
+- insert:
+    - id: preset-lean
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        # order 5（2026-09-22）：官方序列 standard=1 / ptc=2 / minimal=3 / cordis=4，
+        # lean 旧目录预设时代沿用 4 会与 cordis 撞序；registry 同序按 id 字典序，
+        # 虽确定但 Lean 会被 Cordis 压位，故顺延到官方序列之后。
+        id: lean
+        order: 5
+        name: "Lean（核心自动·专项按需）"
+        description: "核心规则与专项目录自动提供，已授权范围内连续实施、验证和修复；专项规则、技能与其他工具按需加载，命中或加载不构成审批停点。规则按版本核对，技能按来源与正文复用，压缩后按需恢复。persona、计划模式和大型快照过滤保持原样。"
+        plugins:
+          - id: tool-bootstrap
+            # 入口走独立文件 + release URL：同路径 *.mjs 会命中 Node ESM 缓存，源码更新
+            # 只有重启宿主才可见。换入口则新会话的下一次装配直接拿到新实现。
+            # 20260913-191500：显式指定 Agent Team 时，本轮首个请求即预置团队工具集；
+            # 触发信号取自 agent/inbox/spliced（装配早于 user/message 落盘），
+            # 跨后续轮次、压缩与 resume 保持，不再需要用户二次提醒。
+            # 20260923-110853：解锁解析改为与 tool_gateway 共用
+            # tool-name-resolver.mjs —— 精确 MCP 名按精确名解析，未知完整名不再
+            # 退化成前缀组。同路径 *.mjs 命中 Node ESM 缓存，故换入口 + release URL。
+            # 20260924-compaction-catalog：压缩后目录改为"压缩核心集 ∪ 本会话已解锁
+            # ∪ team"，与晋升态逐字一致（原实现回到 bootstrap 集，目录缩回再长出，
+            # 会让模型重新解锁同一批工具）。同路径 *.mjs 命中 ESM 缓存，故换入口 + release URL。
+            # 注：目录变化确实作废前缀缓存——新增签名若在全库从未出现，旧缓存仅存活
+            # 0-10%（同路由目录未变步为 97-99%），等于整段按全价重读（实测 76,740-
+            # 244,595 token）。早前"4→13 无惩罚"的受控实验是伪像：那套 13 工具签名已被
+            # 其他 151 个会话写过。签名已存在时旧缓存存活 41%（n=15），全新签名仅 5%（n=29）。
+            # 故此处收益同时计为"缓存节省 + 正确性/少绕路"。
+            # 20260924-failed-compaction：失败的 compaction/end（带 error、不产生
+            # compaction/summary）不再当作检查点边界——它既会让目录在会话中途缩回
+            # （38 次失败压缩中 35 次之后还有请求，其中 13 次改了目录，一个会话 20↔14 横跳 5 次），也会让
+            # 核心规则按会话重复注入（真实会话实测多余 41 次 × 1,306 字符 ≈ 330 token）。同路径 *.mjs
+            # 命中 ESM 缓存，故换入口 + release URL；共享的 compaction-epoch.mjs 导入也带版本号。
+            # 20260924-bootstrap-default：`bootstrapTools` 是唯一没有缺省回退的列表键，
+            # 省略该键会让整行挂载失败（stringList 拒绝 undefined），而同文件的
+            # DEFAULT_BOOTSTRAP_TOOLS 从未被引用。已改为 `?? DEFAULT_BOOTSTRAP_TOOLS`，
+            # 与 residentTools/suppressedContextSources/keptContextSources/bootstrapPersona
+            # 的写法一致；显式传入非法值（空数组/空串/非数组）仍然报错。此处显式配置
+            # 四名集合不变，故线上行为不变。同路径 *.mjs 命中 ESM 缓存，故换入口 + release URL。
+            # 20261017-audit-p0：新增子代理目录键，换入口 + release URL 绕 ESM 缓存。
+            # 20261024-unlockbudget：解锁预算下沉到 tool-name-resolver（discovery 与装配共用）。
+            #   裸 MCP 族名/`*` 展开若超 64 工具或 60k schema 字符则整族延后，不再静默解锁。
+            #   实测 10-22 一次 toolNames:["mcp__rea"] 让目录从 19k 涨到 851k 字符（≈213k token），
+            #   其后 4 次请求全部携带，占三周 lean 会话工具 schema 总量的 16.7%。
+            #   装配侧也要生效（重放原始 tool/call 参数），故换新入口 + release URL 绕 ESM 缓存。
+            # 20261028-022-exposure：0.2.2 把工具准入挪出 system-prompt/assemble
+            # （改为 tools.resolve() 先定集合 + ctx.tools.restrict() 掩码），原
+            # assembled.tools.map 在装配阶段直接抛 "reading 'map'"。换入口 + release URL。
+            # 20261029-toolservice：tool-bootstrap 没有 inject:['tools']，所以
+            # `ctx.tools.schemas(agent)` 会抛 "cannot get property tools without
+            # inject"，目录快照为空 → tool_gateway 无法解锁。改读 ctx.get('tools')，
+            # 并在 step/end 刷新快照，动态注册的工具（skill_load 等）也能进入掩码。
+            # 20261029-gateway：顶层固定为常驻核心 + tool_gateway。所有非驻留工具
+            # （含 agent-scoped 的 Playwright/MCP）由 step-time `when` 隐藏；
+            # gateway 用私有目录 + ctx.tools.execute() 调用，policy/审批/guards
+            # 仍走正常 pipeline。provider 继续自动挂载，能力不丢失。
+            name: '@local/dsh-agent-preset-lean/tool-bootstrap-entry-20261030-keptsections.mjs'
+            config:
+              exposureMode: resolve
+              # 20261030-firstread：首轮补 read（438 字符）。真实近期 23 个 lean 会话里
+              # 首轮 16 次 bash、仅 22 次 read；edit 的 7 次失败集中在没有 read 的编辑路径。
+              # 保留 str_replace_editor 作为 Minimal 锚点，只增加最小读取能力，避免模型
+              # 首轮用 bash cat/sed 代替 read，再触发 read-before-edit 失败。
+              #
+              # 20261030-audit（本轮）：str_replace_editor 已从首轮移除。三条依据：
+              #   1) 185 个历史 lean 会话里它只有 27 次调用、集中在 2 个会话，**从无会话
+              #      在第 1 步用它编辑**（首调用真正读文件内容的只有 27/147）；
+              #   2) 它在 coreToolNames 里（tool-bootstrap.mjs 的 register 钩子直接放行），
+              #      因此晋升后既不在常驻集、也不进 gateway 私有目录——等于不可达；
+              #      移出后它变成 gateway-eligible，需要时可按需取回，能力不丢；
+              #   3) 真实 A/B（leanbench，同任务同模型各 N=5）：首请求 schema
+              #      8,515→5,412 字符（-36.4%，零方差），任务完成率 5/5 无退化，
+              #      请求数/工具调用在方差内（5–7）。
+              #   首轮仍保留 read（避免首轮 cat/sed）与 rule_load、tool_gateway。
+              #   回退：把 str_replace_editor 加回本列表即可。
+              bootstrapTools: [bash, read, rule_load, tool_gateway]
+              promoteOn: either
+              # 20261028：deferUnlockedTools 随 0.2.2 接口一并删除——它靠装配瀑布
+              # 改写 schema 的 deferLoading，而 0.2.2 的装配不再承载 tools。
+              # 输出预算继续使用 adapter 默认值，不为首轮追加截断上限。
+              suppressedContextSources: [agent-instructions, skill-catalog]
+              # 子代理独立进入相同的精简起步阶段，并取得自己的核心规则；
+              # 父会话的动态工具 unlock 不继承。
+              includeSubagents: true
+              # First-request persona: the official Minimal system prompt sentence.
+              # Kept as the only persona in every phase (bootstrap and promoted).
+              bootstrapPersona: !!js process.env.DSH_PERSONA_PREFIX ?? 'You are a helpful software engineer assistant.'
+              # 20261030-keptsections（已回退）：曾用 keptSections 放行 `tool:read` 指引段
+              # （"Use the read tool — not shell commands like cat — …"）。动机是 edit
+              # 的 `file has not been read`：200 个真实会话里 edit 2,569 次调用 / 268 次失败
+              # （10.4%），其中 251 次是该错误（占 edit/write 全部 322 次错误的 78%）。
+              # 但 2×2 消融（同一套多文件复现任务，各 N=5/10）显示：指引送达 5/5，
+              # read-required 9（无）vs 10（有）——**零效果，纯成本 +128 字符/请求**。
+              # 真正有效的是 ~/.dsh/AGENTS.md 核心新增的“改文件前先 read”规则：
+              # 有规则 8 次 / 15 运行，无规则 19 次 / 10 运行（run 级 p≈3.1e-4）。
+              # 机制本身（keptSections 白名单）保留在 tool-bootstrap.mjs 并有单测；
+              # 需要重新启用时取消下面一行的注释即可。
+              # keptSections: [tool:read]
+              # Post-promotion resident whitelist: the core work set the model can use
+              # without unlocking. exit_plan_mode is REQUIRED resident — the plan mode
+              # exit — otherwise a plan-mode session cannot leave. Everything else
+              # (subagent, workflow, ralph, goals, jobs, memory_*, skills, cordis_*,
+              # mcp__playwright-mcp__* 与 mcp__playwright-persist__*, …) is callable through tool_gateway.
+              # pwsh 已删（2026-09-03）：macOS 上 tool-pwsh 恒 disabled，白名单里的死名
+              # 每次会话触发一次 keepTools warnOnce；Windows 会话需要时解锁即可。
+              #
+              # skill_search 不加常驻（2026-09-04 评估结论）：实测它 136 token/请求、
+              # skill_load 84；而扫全部 107 个 projection-cache 会话，真实
+              # tool/call 里 skill_search / skill_load 调用次数为 **0**（日志里那
+              # 218/218 次同名出现是别的预设的 schema 文本，不是调用）。为一个历史
+              # 命中率为零的能力每请求付 136 token 不划算；技能类任务照旧走
+              # tool_gateway 的 list/search + call（多一轮，但只在真用到时才付）。
+              # read_image / subagent 于 2026-09-11 加入（依据 60 会话 5597 次 tool/call 实测）：
+              #   read_image 实际调用 55 次、被解锁 6 次；subagent 调用 49 次、被解锁 6 次。
+              #   两者都高于原本就在白名单内的 glob(25) 和 ask_user_question(12)，
+              #   每次「解锁等一轮」对稳定需求是纯损耗。
+              # agent team 系维持按需，即使 send_message 是解锁冠军（9 次）：单次调用仅 0.2%
+              #   且呈突发性——做团队任务时集中用、不做时一次不用，常驻只是白付 schema。
+              # 20260930-webondemand：web_search 从两份清单撤下并停止注册；web_fetch 保留
+              #   常驻（74 字符描述，10 月 31 次调用/3 个会话，按需解锁反而多一轮）。
+#   理由与搜索三件套同源：自带 web_search 与 tavily/anysearch/exa/deepseek 重叠，留着只会
+#   多一个可解锁名，且“联网搜索”问法会先命中这个重复入口。web_fetch 仍常驻、不进索引。
+              #   依据 EV 管道去污染口径（findings-20260926b/c）：web 双件套 E/会话(顶层)
+              #   12,935，schema 合计仅 169 tok（65+104），携带 ≈126/会话，准入双 ✓。
+              #   2026-09-04 的拒绝依据（当时 0 调用）已因时间漂移失效。
+              #   基线：pre 期解锁调用 27 次；切点写入 research-20260926/ev-pipeline-out/
+              #   web-ab-cutoff.txt。读数条件与回滚规则见 ev-pipeline.json 的 web_ab.decision_rule。
+              residentTools: [bash, read, write, edit, glob, grep, todo_write, read_image, subagent, ask_user_question, tool_gateway, exit_plan_mode, rule_load, send_message, web_fetch]
+              # 20260925-resident-ab：配置 A（破衡点优化）= 上面那份，只加 send_message。
+              #   依据：274 会话语料统计，当前配置期（09-18 起）84 次按需解锁共 3,791,634
+              #   全价 token 失效；其中 send_message 独占 1,619,807（42.7%，14 次事件，
+              #   中位 ctx 118,527——它总在会话后段被解锁用于汇报）。其 schema 仅 140 token，
+              #   常驻代价 140×10,477 步×0.1 ≈ 146,678 → 净省 1,473,129。
+              #   原注释「单次调用仅 0.2%」用的是单请求上下文占比，漏掉了整段全价重读。
+              # 配置 B（全量常驻，用于 A/B 对照）= 把上面两行整体替换为：
+              #   residentTools: ['*']
+              #   compactionTools: ['*']
+              #   （tool-name-resolver 对尾 * 走前缀匹配，'*' 前缀为空即全量）
+              # Post-compaction core work set: mid-task, but a small catalog.
+              # memory / dtodo 已删（2026-09-03，原列表照抄 anchored-standard 上游）：
+              # dsh 没有裸名 memory 工具（dsh-mneme 注册的是 memory_save 等 7 个带后缀
+              # 名），dtodo 全安装树不存在（todo 工具叫 todo_write）。keepTools 对压缩
+              # 分支是 fail-open——任一 keep 名缺失即暴露全量目录，恰好在上下文压力
+              # 最大的时刻击穿 lean。压缩后需要记忆/待办时走 tool_gateway 调用。
+              # exit_plan_mode 也放进压缩核心集：plan-mode 会话若在压缩后仍处于规划态，
+              # 第一轮必须还能正常退出 plan mode，不能等到再次晋升。
+              # 与 residentTools 保持逐字一致（churn-free，见 tool-bootstrap.mjs:574-580）。
+              compactionTools: [bash, read, write, edit, glob, grep, todo_write, read_image, subagent, ask_user_question, tool_gateway, exit_plan_mode, rule_load, send_message, web_fetch]
+              # 20261017-audit-p0：子代理（delegationDepth>0）使用单独的常驻/压缩集。
+              #   maxDepth=1 下 subagent / subagent_fork 不可用，exit_plan_mode 也不适用于
+              #   child；10 月 221 个子代理会话/14,123 步（10 月 9,046 步），这 2,527 字符/步
+              #   的无效目录约合 2,290 万字符前缀；子代理内 subagent 82 次调用有 28 次报错
+              #   （16 次 provider 空、6 次 depth、6 次 route not allowed）。child 仍保留
+              #   bash/read/write/edit/glob/grep/todo/read_image/ask_user_question/
+              #   tool_gateway/rule_load/send_message/web_fetch。
+              subagentResidentTools: [bash, read, write, edit, glob, grep, todo_write, read_image, ask_user_question, tool_gateway, rule_load, send_message, web_fetch]
+              subagentCompactionTools: [bash, read, write, edit, glob, grep, todo_write, read_image, ask_user_question, tool_gateway, rule_load, send_message, web_fetch]
+              # keptContextSources 于 2026-09-11 显式设为空，把 system prompt 对齐到 minimal。
+              #
+              # 2026-09-04 那版依赖默认值 [subagent:delegation, approval:policy, sandbox:policy]，
+              # 理由是子代理看不见「你的权限在启动时固定、被拒的操作不要重试」，会把自动拒绝
+              # 当成偶发失败反复重试（ralph 成倍放大）。代价是 lean 的 system prompt 永远比
+              # minimal 多两段 runtime context：minimal 靠 persona 的 includeRuntimeContext: false
+              # 做到 contexts 全空，而 lean 只把 sections 收敛成单句，contexts 仍留着这三条。
+              #
+              # 既然 lean 的定位是「最小干扰 + 全量按需能力」，提示词就应与 minimal 逐字对齐，
+              # 只留 bootstrapPersona 单句。若日后发现子代理频繁重试被拒操作，单独恢复
+              # sandbox:policy 一条即可，不必三条一起回来。
+              #
+              # 本文件是热加载的，同目录 .mjs 不是（见文件头「怎样才生效」）。
+              keptContextSources: []
+
+          # 20261029-gateway：模型只看固定常驻集 + 这一个 gateway。所有非驻留工具
+          # （MCP/浏览器/skill/memory/团队等）由 tool-bootstrap 的 step-time `when`
+          # 隐藏；gateway 用私有目录 + ctx.tools.execute() 调用，policy/审批/guards
+          # 仍走正常 pipeline。顶层 request.tools 不再随解锁变化，前缀缓存稳定。
+          # 20261030-deadend2：负向清单前移并点名 team/subagent/goal/job 与常驻工具
+          # （真实数据：52 次 search 里 21 次零命中，13 次在检索这些非 gateway 族）；
+          # search 零命中且查询命中“已直接可见”的工具名时，直接点名让模型改用直呼，
+          # 不再给死胡同。描述 1446→1380 字符（-66），action 参数描述逐字未变，
+          # ALWAYS SEARCH FIRST 原句保留。换入口 + release URL 绕 ESM 缓存。
+          - id: tool-gateway
+            name: '@local/dsh-agent-preset-lean/tool-gateway-entry-20261030-deadend.mjs'
+
+          # 20261017-audit-p1：在 tools/execute（pre-execute 之后、defineTool 校验之前）
+          #   归一化模型参数：bash 缺 description 时补一行；sandbox_permissions 无有效
+          #   justification 或不在枚举内时丢弃（回到当前沙箱，不静默升级）；subagent 的
+          #   provider/model/reasoning_effort 空串按“未指定”处理（继承父路由）；path 字段
+          #   的前导 ~ 展开为 home。10 月对应错误：bash 47+32+16+6、subagent 26+3、
+          #   read 9 次 ~ 路径。
+          - id: tool-call-normalizer
+            name: '@local/dsh-agent-preset-lean/tool-call-normalizer-entry-20261021-router-fix.mjs'
+
+          # ── identity ────────────────────────────────────────────────────────────────
+
+          # The preset's own persona row. tool-bootstrap's assemble filter replaces the
+          # assembled sections with the Minimal sentence in EVERY phase (bootstrap and
+          # promoted), so the text below is the same single sentence. Keep this section
+          # non-complete: the filter has a deliberate plan:policy carve-out. Runtime
+          # contexts stay enabled here so the filter can retain policy facts while dropping
+          # memory/runtime snapshots.
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              # alpha.2: dsh-persona 配置拆分为 prefix/suffix（旧 text 字段已废）。
+              # persona 原文保持不变；核心规则由独立的 user 消息提供。
+              prefix: !!js process.env.DSH_PERSONA_PREFIX ?? 'You are a helpful software engineer assistant.'
+
+          # 官方全量注入继续关闭，避免和核心自动、专项按需重复。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            disabled: true
+
+          # 旧提示把规则误称为仅供参考的环境资料；新插件同时提供核心、目录和项目规则路径。
+          - id: instruction-hint
+            name: '@local/dsh-agent-preset-lean/instruction-hint.mjs'
+            disabled: true
+
+          # ── shell ───────────────────────────────────────────────────────────────────
+
+          # The captured executor is a private preset service. The outer realm is needed
+          # because a service row at the preset root would leak into the process-global
+          # realm and be rejected by dsh-agent-presets. The nested shell realm then
+          # shadows only `shell` for the normalizer and its model-facing tools.
+          - id: shell-stack
+            name: cordis:group
+            group: true
+            isolate:
+              leanShellParent: true
+            config:
+              - id: shell-parent-capture
+                name: '@local/dsh-agent-preset-lean/shell-parent-capture.mjs'
+
+              # Isolated shell seam: normalize model-generated Unicode non-breaking spaces
+              # before the executor resolves the command. The group gives the wrapper its
+              # own `shell` service scope, so this stays local to the lean preset and does
+              # not patch the host shell for other presets.
+              - id: shell-normalized
+                name: cordis:group
+                group: true
+                isolate:
+                  shell: true
+                config:
+                  - id: shell-space-normalizer
+                    # 2026-09-22：0.1.7 执行器接口改为 execute()/resolve()（0.1.6 的
+                    # run()/start() 已移除）。旧实现只转发 run/start，缺 execute，
+                    # 导致本隔离作用域内所有 shell 工具报
+                    # `ctx.shell.execute is not a function`。改用 017 入口：既修接口，
+                    # 也换模块 URL —— 同路径 *.mjs 会命中 Node ESM 缓存，换名后无需重启宿主。
+                    # 20260923-110853：wrapper 不再无条件把 Unicode 空格替换成 ASCII
+                    # 空格。命令是不透明源文本，字面量/引号/转义/heredoc 里的空格必须
+                    # 原样到达执行器；修正分隔符属于调用方。换入口绕过 ESM 缓存。
+                    # 20260927: supplement inherited macOS CLI PATH in LEAN only;
+                    # preserve explicit PATH, command bytes and sandbox policy.
+                    name: '@local/dsh-agent-preset-lean/shell-space-normalizer-019.mjs'
+
+                  # 标准 subprocess bash（bash -c），macOS/linux 用；Windows 由下方 custom-bash
+                  # 提供（同一 `bash` 工具名，同层不能重复注册）。2026-09-02 从 PTY 持久 bash 切回：
+                  # PTY 传输会把含 `(1)` + 中文 的路径 mangle 成 "syntax error near unexpected
+                  # token `1'"（张加志业绩(1)-7月.xlsx 那次 32 次工具调用全耗在重试 shell 引号上）。
+                  # bash -c 子进程无此问题。对齐 ptc-mcp 的 tool-bash 写法。
+                  - id: tool-bash
+                    name: '@deepseek-ai/dsh-tool-bash'
+                    disabled: !!js process.platform === 'win32'
+
+                  - id: tool-pwsh
+                    name: '@deepseek-ai/dsh-tool-pwsh'
+                    disabled: !!js process.platform !== 'win32'
+
+          # PTY 持久 bash（原为对齐官方 minimal 的 bash schema）。2026-09-02 停用：PTY
+          # 传输会把含 `(1)` + 中文 的路径 mangle 成 "syntax error near unexpected token `1'"。
+          # bash 已改由上面的标准 tool-bash（bash -c 子进程）提供。若未来 PTY 传输修复，回退两步：
+          # 删掉这个 disabled: true，同时给 tool-bash 重新加上 disabled: true。
+          - id: persistent-shell
+            name: cordis:group
+            group: true
+            disabled: true
+            isolate:
+              terminals: true
+            config:
+              - id: pty
+                name: '@deepseek-ai/dsh-terminal'
+
+              - id: terminal-bash
+                name: '@deepseek-ai/dsh-terminal-bash'
+                config:
+                  timeoutMs: 300000
+
+              - id: persistent-bash
+                name: '@deepseek-ai/dsh-tool-bash-persistent'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a bash shell
+                    * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+                    * You don't have access to the internet via this tool.
+                    * You do have access to a mirror of common linux and python packages via apt and pip.
+                    * State is persistent across command calls and discussions with the user.
+                    * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+                    * Please avoid commands that may produce a very large amount of output.
+                    * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+          # Windows-only `bash` tool: registers the SAME tool name as the persistent
+          # shell with a Minimal-compatible description, but executes through the
+          # ordinary cross-platform subprocess seam (`bash -c`) instead of a PTY. Point
+          # bashPath at Git Bash explicitly (AGENTS.md: C:\Program Files\Git\bin\bash.exe).
+          # No OS sandbox confinement on Windows (landlock is linux-only).
+          - id: custom-bash
+            name: '@local/dsh-agent-preset-lean/custom-bash.mjs'
+            disabled: !!js process.platform !== 'win32'
+            config:
+              bashPath: 'C:\Program Files\Git\bin\bash.exe'
+
+          # ── filesystem ──────────────────────────────────────────────────────────────
+
+          # Both register into the host `tools` registry and provide nothing, so
+          # they need no realm. The `fs` service and its policy stay in the host.
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          # The Minimal preset's second tool: `str_replace_editor` over a bare local
+          # filesystem, byte-identical in configuration to the official `minimal`
+          # preset's `filesystem` group. The editor's own realm shadows the host's
+          # sandboxed `fs` provider only inside this group, so the standard `read`/
+          # `write`/`edit` tools keep the sandboxed fs while the bootstrap editor uses
+          # the local one.
+          - id: bootstrap-filesystem
+            name: cordis:group
+            group: true
+            isolate:
+              fs: true
+            config:
+              - id: fs-local
+                name: '@deepseek-ai/dsh-fs-local'
+                config:
+                  cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+              - id: str-replace-editor
+                name: '@deepseek-ai/dsh-tool-str-replace-editor'
+                config:
+                  maxOutputChars: 16000
+
+          # ── background jobs ────────────────────────────────────────────────────────
+
+          # Only the model-facing controls. The task REGISTRY stays on the host plane:
+          # its producers sit outside any realm this file could put it in — `tool-bash`
+          # above resolves it with `ctx.get`, and an entry-local realm here is invisible
+          # to every sibling row, so `run_in_background` would answer "background jobs
+          # unavailable" while these controls sat in the catalog. The registry is keyed by
+          # owning agent anyway, so one host instance serves every session. What a preset
+          # chooses is whether its agent can collect and stop background work at all.
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          # ── skills ──────────────────────────────────────────────────────────────────
+
+          # The skill REGISTRY lives in the host composition and is layered per scope:
+          # these rows register into THIS preset's layer of it, so they need no realm.
+          # `tool-skill` is DISABLED: the ~9KB <available_skills> catalog injection is
+          # a large block that pulls the trajectory back to standard-like behavior
+          # after promotion (issue #6: 0/9 anchored with the catalog present vs ~81%
+          # without; measured regression on 2026-08-16). Skills stay discoverable via
+          # `tool_gateway` (search + unlock) and the user can still invoke a skill
+          # gesture explicitly.
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+            disabled: true
+
+          # 按需技能：有专项方法缺口才搜索，已知名称可直接加载；搜索命中不是批量加载清单。
+          # 保留来源信息，未变正文复用；变更可重载，压缩后按需恢复，不注入全量技能目录。
+          # 20260924-failed-compaction：失败的压缩不丢技能版本（正文仍在对话里，
+          # 重投只会白烧上下文）；只有真实检查点才允许重载。
+          - id: skill-search
+            name: '@local/dsh-agent-preset-lean/skills-on-demand-entry-20260924-failed-compaction.mjs'
+
+          # 单一来源 ~/.dsh/AGENTS.md：0 号核心自动注入，1–8 号专项按需；
+          # 内容摘要确认版本，旧编号记录不冒充新版本。新模块路径供新会话直接装配。
+          # 20260924-failed-compaction：只有真实检查点才重新注入核心、重列已加载专项；
+          # 失败压缩曾让核心块重复下发（实测多余 41 次 × 1,306 字符）。
+          - id: rule-search
+            name: '@local/dsh-agent-preset-lean/rules-hybrid-entry-20260924-failed-compaction.mjs'
+
+          # ── on-demand tool discovery ────────────────────────────────────────────────
+
+          # 2026-09-22：改走独立入口 + release URL。同路径 *.mjs 会命中 Node ESM
+          # 缓存，源码更新（本轮索引死条目清理）只有重启宿主才可见；换入口则新会话
+          # 的下一次装配直接拿到新实现。
+          # 20260923-163510：索引增补 batch（@local/dsh-lean-batch 提供的程序化
+          # 批量工具，native 呈现、无生成 SDK），并加中文别名 批量→batch。索引内联
+          # 在本工具的 description 里，且 tool-bootstrap 不 import 本模块，故只需换
+          # 这一行入口。同路径 *.mjs 命中 ESM 缓存，换入口 + release URL 绕过。
+          # 20260923-165050：Usage 行去掉"先搜 then 再解锁"的顺序暗示，改为一并传入
+          # query + toolNames 一次调用完成（execute 本身支持两个字段并存，先出解锁
+          # 结果再出匹配）；模型按字面分两步走会白付一整轮往返。同路径 *.mjs 命中
+          # ESM 缓存，故换入口 + release URL。
+          # 20260923-harden：索引补 workflow / present（已挂载却从未被承诺），
+          # str_replace_editor 条目改为真实能力（原写"单次调用多处替换"，该工具
+          # 只有 view/create/str_replace/insert）。换入口绕 ESM 缓存。
+          # 20260925-familyunlock：Usage 行不再默认推荐整族解锁，改为「优先精确名 + 量化代价」。
+          #   依据 T2 全量统计（201 个 lean 会话 / 29,846 次 tool/call）：非驻留暴露 1317
+          #   个「会话×工具」对中 920 个（69.9%）从未被调用；浪费集中在组解锁 ——
+          #   mcp__github__* 218、mcp__computer-use__* 58、dev_* 54，而精确解锁的
+          #   浏览器域仅 3、cordis 仅 2。溢出 schema 合计 162,587 token。
+          #   同路径 *.mjs 命中 ESM 缓存，故换入口 + release URL（免重启，新会话生效）。
+          # 20260926-indexresync：索引/描述与配置失同步修复（守门测试 2 红 → 全绿）。
+          #   描述常驻清单补入 send_message（9-25 常驻时漏改，模型会为已常驻工具白付
+          #   一轮解锁）；索引撤下 send_message 与已停用的 mcp__computer-use__* /
+          #   mcp__blender__*（索引承诺必须可兑现——9-22 的既定纪律，停用 server 时
+          #   同步撤索引行，重新启用时加回）。换入口 + release URL 绕 ESM 缓存。
+          # 20260926-suggest：missing 解锁加近似名建议。EV 管道实测（228 次解锁调用）
+          #   36 次 No tools match（15.8%），几乎全是可当轮纠正的猜测（mcp__github__get_issue
+          #   这类似是而非的名）或 MCP 未连上窗口期的整族名；每次失败白付一整轮往返。
+          #   现在 missing 时同 call 输出 closest 名单 / family 存在提示 / server-down 诊断。
+          # 20260926-webab：同批改动换新入口（描述常驻清单 16 名 + 索引撤 web 行，
+          # 与 residentTools/compactionTools 的 web 双件套 A/B 保持同步）。
+          # 20260926-rank：换入口 —— 匹配结果按相关度排序（relevanceOf 计分，同分保持
+          #   目录序）。描述与 schema 零变化，不影响在途 web A/B。
+          # 20260927-maintenance：修复家族提示并缩短描述；常驻集合不变，
+          #   但 schema 文本有变化，后续 A/B 与缓存分析须标记本次维护边界。
+          # 20260928-budgetindex：索引渲染改走预算路径（单条 250 字符上限 +
+          #   总预算 2000，超限降级为仅名字行）；当前索引两条预算都未触及，
+          #   渲染字节等价、schema 文本零变化，不影响在途 web A/B。
+          # 20260929-resultbudget：关键词发现页按源端预算截断（超长名称/查询/批量解锁
+          #   均有界，最终响应上限 3800 字符），续页按实际渲染行推进；查询无匹配与
+          #   显式解锁失败分开表述。常驻集合、解锁解析与 web A/B 配置均未改变。
+          # 20260929-resultbudget2：对抗审查修复——为页面固定装置预留空间，必要时
+          #   先丢弃可选建议行，禁止末位截断吃掉 Next page 续页行（静默丢结果）。
+          # 20261017-audit-p0：索引改为只承诺当前 0.2.1 组合里真实存在的家族；
+          #   旧的 mcp__playwright-mcp__* / mcp__playwright-persist__* / mcp__github__*
+          #   三行共 73 个工具在 live catalog 中一个都没有，10 月 10 次 no-match 有
+          #   8 次是在猜这些名字。同时补上 browser_* / session_* / terminal_* 等真实
+          #   家族；描述从 3,034 压到 2,275 字符，索引从 1,827 压到 932 字符。
+          #   同路径 *.mjs 命中 Node ESM 缓存，故换入口 + release URL。
+          # 20261024-rea-core：新增 `rea` bundle，只含 REA 逆向 6 个核心工具
+          #   （binary_session/open_binary/search_procedures/binary_overview/
+          #   analyze_function/close_binary），合计约 6.8k schema 字符（≈1.7k token）。
+          #   禁止用 mcp__rea 整族：207 件/832k 字符/约 208k token。
+          #   同路径 *.mjs 命中 Node ESM 缓存，故换入口 + release URL。
+          # 20261017-audit-p0：删除本预设自带的 repeated-tool-guard。
+          #   宿主 dsh-base 已默认挂载 @deepseek-ai/dsh-repeat-tool-reminder
+          #   （thresholds [3,5,8]，post-execute 计数），两者同时生效时同一会话
+          #   会出现两套提醒：实测 16 个有提醒的会话中 8 个同时出现两种文本，
+          #   合计 42 条自定义 + 45 条宿主提醒。保留宿主版即可；轮询工具的
+          #   exclude 由 profile 层按需补，不再在预设内维护第二套状态机。
+
+          # ── goals ───────────────────────────────────────────────────────────────────
+
+          # The goal SERVICE and session driver stay on the host plane, where the Gateway
+          # can resolve them. The human `/goal` command and the model-facing tool register
+          # into this preset's scoped layers, so both rows must be mounted here.
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+
+          # ── plan mode ───────────────────────────────────────────────────────────────
+
+          # Plan state is per-agent by nature, so an entry-local realm is not a
+          # workaround here — it is the correct lifetime.
+          #
+          # Catalog invariant (official standard plan-mode rule): dsh-plan-mode
+          # registers `exit_plan_mode` once at mount and only changes the
+          # `plan:policy` system section; it never calls tools.restrict. Keep
+          # `exit_plan_mode` in BOTH residentTools and compactionTools above,
+          # otherwise entering/leaving plan mode would change the request tool
+          # catalog and invalidate the prompt-prefix cache. Bootstrap phase
+          # intentionally omits it; do not enter /plan before promotion.
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                        You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                        Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                        The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                        Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                        Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                        When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+          # ── compaction ──────────────────────────────────────────────────────────────
+
+          # `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner must
+          # share this realm rather than sit outside it.
+          #
+          # `tokenMeter` is deliberately NOT in this realm: the meter stays on the HOST
+          # plane, and the rows here resolve that one instance. It takes no configuration,
+          # keys every fold by Session, and owns the context-meter projection units the
+          # browser reads for every session — behind a realm those units would come and go
+          # with whichever presets happen to be mounted. What a preset chooses is whether
+          # its agent compacts at all, which is `compaction-basic` below.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              # 压缩触发（2026-09-24 改为 40 万固定触发、保留 8 万）：
+              # 依据近 15 个真实 lean 会话 3375 次请求实测——每次请求平均带 23.6 万
+              # token，其中 77% 的输入 token 花在 20 万以上的请求上，而窗口是 1M 时
+              # ratio 0.6 等于要涨到 60 万才压缩（pruner 也只在压缩触发时才跑，
+              # 于是大结果裁剪长期形同虚设）。
+              # 1M/1.04M 窗口路由统一按 thresholdTokens 改写为绝对 40 万
+              # （由 compaction-absolute-threshold 按实时窗口换算 ratio），
+              # retainTokens: 80000（保留最近约 8 万）。
+              # 262k 窗口的路由不套这条策略（否则阈值 0 会误触发），仍走下面的
+              # thresholdRatio: 0.6；modelPolicies 只按精确 provider/model 匹配，
+              # 未列到的路由自动用默认值，所以这里是一份不含窗口假设的配置。
+              # 建模口径：压缩后"缩回去再长回来"的工具目录已修（压缩后直接用晋升
+              # 目录），且实测每次压缩的恢复开销（重新解锁 0.27 次、重读文件 0.71 次、
+              # 额外缓存失效 0.08 次）远小于继续携带历史的成本，所以按"每多压一次净省
+              # 0.5M+ 等效 token"取这份更激进的策略；每多压一次的恢复开销约 0.1M。
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  # 默认值只作用于无法套用绝对阈值的路由（窗口 − 预留输出 ≤ 25 万，
+                  # 例如 262k 窗口），保留 ratio 语义。
+                  thresholdRatio: 0.6
+                  headroomTokens: 65536
+                  maxTokens: 65536
+                  retainRatio: 0.16
+                  # ── 摘要模型固定（2026-10-02）──────────────────────────────────
+                  # 现象：会话 session-example-b「无法压缩、无法对话」——每个 turn 的
+                  # pre-step 压力压缩先跑 2 次摘要（compactionRetries 默认 1），两次都
+                  # 失败，单步阻塞约 5–10 分钟；手动 /compact 同样以摘要失败收场。
+                  # 根因（实测，非推断）：摘要默认跟随"最近一次已路由请求"的
+                  # provider/model（summarizeWithLlm 里 latest 优先于 agent.options），
+                  # 而该会话最近一次成功路由是 router-responses/model-a
+                  # （= desktop profile 的 agent-default-model）。这条路由只回加密
+                  # reasoning、没有 text：turn 41 assistant/message 的
+                  # replayState.response.stopReason="length"、content 仅 1 个 reasoning 块，
+                  # turn/end 原因同样是 max-tokens。
+                  # 摘要调用于是要么被输出上限截断，要么流没到终止事件：
+                  #   compaction/end error="summarization truncated at the token cap (incomplete checkpoint)"
+                  #   compaction/end error="OpenAI Responses stream ended before a terminal response event"
+                  # 只给这条路由钉一个可用摘要模型（历史 5 次成功压缩都在
+                  # relay-primary/deepseek-v4.1-flash，输出 3.6–5.2k token）：
+                  # 其余路由仍跟随会话路由，保住 prefix cache 复用
+                  # （实测成功压缩 cacheRead ≈ 283k/次），不为此付全价输入。
+                  modelPolicies:
+                    - provider: router-responses
+                      model: model-a
+                      summarizationProvider: relay-primary
+                      summarizationModel: "deepseek-v4.1-flash"
+              # 20261017-audit-p2：连续 3 次 "summary is not smaller than the
+              #   shadowed content" 后停止本 turn 的自动压缩。10 月 a4cf5d 单个
+              #   turn 连续 11 次、全会话 32 次该类失败，每次都要付一整次摘要
+              #   请求且不缩小上下文。换入口 + release URL 绕 ESM 缓存。
+              - id: compaction-refill-guard
+                name: '@local/dsh-agent-preset-lean/compaction-refill-guard-entry-20261017-auditp2.mjs'
+
+              # 绝对压缩阈值（2026-09-24）：把"窗口比例"改成"路由实际窗口的固定
+              # 阈值"。静态 modelPolicies 表做不到这件事——provider 由插件在运行时
+              # 注册（relay-cn 等根本不在 cordis.patch.yml 里），漏配一条就是
+              # 静默退回 0.6＝1M 窗口要涨到 60 万才压缩。本插件在运行时读
+              # tokenMeter + llm 解析出的真实窗口，按固定阈值改写该路由的策略。
+              - id: compaction-absolute-threshold
+                name: '@local/dsh-agent-preset-lean/compaction-absolute-threshold-entry-20260924-400k.mjs'
+                config:
+                  thresholdTokens: 400000
+                  retainTokens: 80000
+                  minWindowTokens: 250000
+
+              # 压缩后的任务锚定与计划过期提醒（2026-09-24）：
+              #   1) 压缩成功后把 todo 列表重新带回一次——摘要是压缩过的叙述，而待办是
+              #      权威状态，压缩阈值定在 40 万后仍比 60 万 ratio 触发更频繁，
+              #      靠摘要记住计划不可靠；
+              #   2) 有未完成待办却连续 25 步没更新 todo 时提醒一次（实测 149 轮里用过
+              #      todo 的 22 轮，中位 19 步、p90 67 步没有更新）。
+              # 两条都是不阻断的短消息（约 100-200 token），不改工具目录、不写参数值。
+              - id: todo-anchor
+                name: '@local/dsh-agent-preset-lean/todo-anchor.mjs'
+                config:
+                  staleSteps: 25
+                  maxAnchorsPerTurn: 2
+
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                # 2026-09-11 从 8192/4096/1024 收紧：bash 占工具调用 64.5%，是历史膨胀的
+                # 最大来源，而 pruner 是纯字符裁剪、不走模型、零调用成本，最划算的一刀。
+                # head+tail = 3072 仍小于 thresholdChars 4096，保持「裁剪后必然短于阈值」的不变式。
+                config:
+                  thresholdChars: 4096
+                  headChars: 2048
+                  tailChars: 1024
+
+          # ── delegation and workflows ────────────────────────────────────────────────
+
+          # The `subagents` registry and its spawn/fork backends live in the HOST
+          # composition: the registry is a process singleton whose cross-session queries
+          # the api-proxy serves to the browser, and a provider name may only be
+          # registered once. This preset contributes the delegation TOOLS, which resolve
+          # that host registry.
+          #
+          # `workflows` is different — nothing outside an agent reads it — so every row
+          # that reaches it shares one entry-local realm here, and a consumer left
+          # outside would resolve a host registry this preset does not populate.
+          #
+          # `tool-subagent-report` is host-plane for the same reason as the registry,
+          # not because a preset may not want it: it registers a CONTINUABLE SETUP on
+          # that singleton rather than a tool this agent calls, and the setup list is
+          # not scope-aware — one copy per mounted preset means every child gets
+          # `report` registered once per live session, which throws on the second.
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+
+              # 2026-10-28（dsh 0.2.2-alpha.2）：不再单挂 list-agents 行。
+              # 旧 specifier '@deepseek-ai/dsh-tool-subagent-control/list-agents' 的
+              # 子路径在 0.2.2 已从 package.json exports 移除（ERR_PACKAGE_PATH_NOT_EXPORTED）；
+              # 该行 import 失败 → 行 never started → 整棵 lean 预设 broken →
+              # 新 lean 会话报 agent-preset/invalid（启动失败）。
+              # 0.2.2 起 list_agents 由 dsh-tool-subagent-control 主入口的 apply() 自己注册
+              # （lib/index.js:154 registerListAgents(ctx)），上面那一行即已提供该工具。
+
+              # 普通 subagent（spawn）跟随父会话路由，不额外钉模型。
+              # tool-subagent-fork（fork）原先钉死 deepseek-official/deepseek-v4-flash +
+              # reasoningEffort max，但该 provider 在本机 settings 中并不存在，fork 实际
+              # 起不来。2026-09-10 起不再钉模型，改为继承父会话路由。
+              #
+              # 20260915 修：0.1.6 的 `list_subagent_models` 由**一个** delegation 工具实例
+              # 注册（dsh-tool-subagent/lib/index.js:172 registerListSubagentModels，注释原文
+              # "Register `list_subagent_models` for one owning delegation-tool instance"），
+              # 同一 scope 内只能有一个 `modelSelectionSettings: true`。此前 fork 行也打开该
+              # 开关，与 spawn 行在同一 tools registry 里重复注册 → "tool
+              # \"list_subagent_models\" is already registered in this scope" → 新会话创建失败。
+              # 官方 standard/ptc/cordis 三个预设也都只在 spawn 行打开它。故 fork 行保持关闭。
+              # 另注：`subagent-model-selection` 设置段的 schema 只有 enabled/allowedModels
+              # （见 dsh-tool-subagent/lib/model-selection-settings.js），settings.yaml 里的
+              # defaultModel / defaultReasoningEffort 在 0.1.6 无任何消费者；该策略只在
+              # 模型显式传 provider/model 时做白名单校验，不提供默认路由。所以 fork 行关掉
+              # 开关不改变实际路由：未显式指定时一律继承父会话。
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+                  backgroundMode: continuable
+
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+                  backgroundMode: continuable
+
+              # 跨模型委派入口 subagent_claude_opus 已于 2026-09-13 删除。
+              # 它原先是 provider=spawn + agentOptions 路由到 router/model-b，
+              # 每请求占 368 token schema，实测使用率仅 1.5%（137 会话 / 476 请求），
+              # 属跨模型入口里性价比最差的一档：常驻不值得，而按需解锁时它在
+              # tool_gateway 索引中同样可达。需要异构审查时用普通 subagent 并显式指定
+              # provider/model 路由即可，不必为它保留一个专门的目录项。
+              #
+              # Product providers are host-plane singletons. Copy this preset, then
+              # remove `disabled` from either ordinary tool row to expose that product
+              # only to agents composed from the copy. 注意：codex / claude-code 作为
+              # subagent 后端在本机安装中不存在（dsh-subagent 无注册），启用只会得到
+              # 运行时错误——要跨模型请用上面的 spawn + agentOptions 路由写法。
+              - id: tool-subagent-codex
+                name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
+                config:
+                  provider: codex
+                  toolName: subagent_codex
+                  backgroundMode: one-shot
+                  maxDepth: provider-managed
+
+              - id: tool-subagent-claude-code
+                name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
+                config:
+                  provider: claude-code
+                  toolName: subagent_claude_code
+                  backgroundMode: one-shot
+                  maxDepth: provider-managed
+
+              # 0.1.6 接口：workflow 运行时由 worker-thread 换成 PTC。
+              # ptc-runtime 行**不在这里**：`ptcRuntime` 是 host 服务，由 dsh-base 顶层
+              # （dsh-base/cordis.patch.yml:369 - id: ptc-runtime）注册；官方 0.1.6 的
+              # standard/ptc 预设的 delegation group 里同样只有 workflow-ptc。
+              # 20260915 修：此前本预设照搬 base 的迁移 diff，在 group 内又插了一行
+              #   - id: ptc-runtime / name: '@deepseek-ai/dsh-ptc-runtime-node'
+              # 导致 `service "ptcRuntime" has been registered` 重复注册 → lean 预设
+              # 整体挂载失败 → 所有会话 resume 失败、消息发不出去（UI 无任何报错）。
+              # 该行必须删除；只保留 workflow-ptc，它自行解析 host 的 ptcRuntime。
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+
+              # 0.1.6 起官方默认不再启用 Ralph（dsh-base 的 tool-ralph 行带 disabled: true）。
+              # 2026-09-22 恢复：tool_gateway 索引长期承诺 ralph 可解锁，但本行
+              # disabled 使解锁永远落空（实测 No tools match）。lean 是全量按需定位，
+              # 索引承诺即须可兑现——恢复后 ralph 工具注册名 `ralph` 与索引一致。
+              # 0.1.7 另挂 systemPrompt section tool:ralph（仅显式要求时使用的策略）。
+              - id: tool-ralph
+                name: '@deepseek-ai/dsh-tool-ralph'
+                config:
+                  subagentProvider: spawn
+                  maxRounds: 64
+
+          # ── remaining model-facing rows ─────────────────────────────────────────────
+
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          # The `web` service and its search provider stay in the host composition; only
+          # the model-facing tool is per-session.
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              # 20260930-nowebsearch：自带 web_search 整条撤下（`search: false` ⇒ 不注册），
+              #   目录与解锁面里都不再出现。理由：它是「一条引擎链 + 自动降级」的旧入口，
+              #   与本机搜索三件套（tavily / anysearch / exa）能力重叠；留着只会多一个
+              #   可解锁名（README 与索引都承诺过它），"联网搜索"这类问法还会先把模型
+              #   引到这个重复入口上。底层 `web` 服务 + deepseek 搜索 provider 仍留在宿主
+              #   组合（不注册工具就不产生目录项），要恢复只删这一行。
+              #   注：host 层的 tool-web 行已被 dsh-web-app 置 disabled，本行是唯一挂载点。
+              search: false
+              # fetch 开启（2026-09-03，原 false）：web_fetch 重新注册，模型可解锁后
+              # 直接抓 URL 正文，不必为抓页专门解锁 playwright。仍受 tool_gateway
+              # 门控，不进常驻目录。
+              fetch: true
+              searchTimeoutMs: 60000
+
+          # ── presentation / cordis 动态组合（2026-09-22 按官方预设补齐）──────────────────
+          #
+          # 官方 standard / ptc / cordis 三个预设都带 `present`，cordis 预设另带
+          # `tool-cordis`；lean 此前两者皆无，是与官方预设差距最明显的两处能力缺口。
+          # 两个包都已在 profile 与版本树就位，不需要新增依赖。
+          # 与其余按需能力一致：装配但不进常驻目录，模型用 tool_gateway 调用。
+
+          # 结构化呈现（表格 / 图表 / 卡片）：让长结果以可读形态落到会话里，而不是堆成纯文本。
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+
+          # cordis 组合的动态定义与检查：agent 可自行定义、运行、检查插件，
+          # 而不只是消费现成工具。
+          - id: tool-cordis
+            name: '@deepseek-ai/dsh-tool-cordis'
+
+
+          # ── MCP 工具（受 residentTools 门控：不常驻，用 tool_gateway 调用）────────────────────────────────────────
+          #
+          # 下面原有 4 行原本写在 ~/.dsh/profiles/web/cordis.patch.yml 的 host 层，**无效**：
+          # MCP 客户端的工具必须挂在 agent 预设层才会进入 agent 的工具目录。
+          # 实测原有四个 server 全部健康（stdio 握手 + tools/list 成功）：
+          #   playwright 23 个 / serena 29 个 / github 26 个 / computer-use 30 个 = 108 个工具
+          #   （computer-use 引擎已换 ZCode：cua-server/run-mcp-server.sh，2026-09-03）
+          # 但因为挂错平面，此前一个都没暴露给模型（host tools.schemas() 43 个无一 mcp__ 前缀）。
+          # 参照 apple 预设 mcp-xcode 行的写法（同一机制，那边是生效的）。
+          #
+          # ── 关于「MCP 懒启动」的结论（2026-09-04 调研，勿重复踩）────────────────
+          # 结论：当前架构下不可落地，且收益远小于预期，保持现状（照常启动 + schema 门控）。
+          # 证据链：
+          #   1. MCP 进程不是每会话启动。dsh-agent-presets 的 standing mount 按 preset.id
+          #      单例缓存（"share one composition"，index.js ensureStanding），实测 51 个
+          #      会话目录只对应 3 个 MCP 进程，且存活时长 == 宿主进程时长。
+          #   2. 成本实测（2026-09-25 复测，RSS）：playwright 2 进程约 202 MB
+          #      （npm exec 91 + server 111）、github 62 MB、computer-use 73 MB；
+          #      全链路 6 个进程合计约 337 MB。原记的「约 110 MB」是 2026-09-03 的数字，
+          #      已过时约 3 倍 —— playwright 现在多了一层 npm exec 包装进程。
+          #      桌面 profile 现在只挂 github + playwright 两套（约 264 MB）；
+          #      computer-use 不挂（很少用，73 MB）。
+          #      整个宿主生命周期一份；token 成本为 0（schema 已被 residentTools 门控挡在
+          #      模型目录外，这才是 lean 真正要省的东西）。
+          #   3. 不可落地的原因：dsh-mcp-client 的 apply() 里 startConnection 无条件执行并
+          #      await connection.ready，没有 lazy 开关；要延迟就得延迟整个 row 的 apply。
+          #      而 standing composition 是**跨会话共享**的，在里面按需启停 MCP 会波及所有
+          #      同预设会话（A 会话用完 stop，B 会话的工具跟着消失），属于把单例当会话态用。
+          #   4. 真要省这 337 MB，正确做法是停用不需要的 server（删/加 disabled），
+          #      代价是该 server 无法再被 tool_gateway 调用——这是配置选择，不是优化。
+
+          # ── 持久登录态浏览器（原 mcp-playwright 行；2026-09-15 起与新 provider 并存）──────
+          # 两套浏览器的分工（靠名字区分，勿再改回两者叫 playwright）：
+          #   mcp__playwright-persist__*（本行，23 个）
+          #     —— 持久 profile（~/Library/Caches/ms-playwright/mcp-chrome-*），**保留登录态**，
+          #        进程级单例、全预设会话共享一个浏览器。渠道桥 / 额度查询等需要登录态的任务用它。
+          #   mcp__playwright-mcp__*（host 层 browser-use provider，24 个）
+          #     —— 每 agent 一个独立 Chromium（--isolated），不保留登录态，agent 间互不打扰。
+          #
+          # 为什么把 serverName 从 playwright 改成 playwright-persist（2026-09-15）：
+          #   原来两个命名空间是 mcp__playwright__ 与 mcp__playwright-mcp__，差一个 "-mcp"，
+          #   而前缀匹配是 startsWith。实测 `query: "playwright"` 会**同时命中两组 48 个工具**，
+          #   模型看不到前缀边界，于是在两边反复试错（先试 mcp__playwright-mcp__browser_navigate
+          #   失败 → 换 query → 再试 mcp__playwright__browser_navigate 失败 → 最后才成功），
+          #   并因此把两套 schema 都解锁（该请求起每轮 3654+3980=7634 token）。
+          #   改名后工具名前缀变成 mcp__playwright-persist__，与本 provider 的
+          #   mcp__playwright-mcp__ 可用语义词区分，搜索可命中单一目标。
+          #
+          # 成本口径（2026-09-15 实测，CJK 1.6 字符/token、拉丁 4）：
+          #   - 不解锁：仅 tool_gateway 的目录提示多 1 行，约 39 token/请求
+          #   - 解锁本行：+3654/请求（该会话此后每轮）；解锁 provider：+3980
+          #   两个 server 的 instructions 均为空（实测 0 字节），无额外常驻系统提示。
+          #   解锁是会话级的（upsert 进 session 事件，resume 保留），不是全局。
+          #
+          # 改本行注意：
+          #   - failOnStartupError: false 是刻意的：后端起不来只是没工具，不会拖垮预设挂载。
+          #   - npx 要能解析到 @playwright/mcp@0.0.75（npm_config_cache 指向已缓存目录）。
+          #   - 若改名 serverName，旧会话里已记录的 mcp__playwright__* 解锁名会失配
+          #     （那些会话的解锁按名匹配，改名后不再命中），属预期：新会话用新名即可。
+          - id: mcp-playwright
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: playwright-persist
+              transport: stdio
+              command: npx
+              args: ['-y', '@playwright/mcp@0.0.75']
+              env:
+                npm_config_cache: /Users/USER/.codex/.cache/npm-playwright-mcp
+                # 2026-09-26：GUI 宿主（桌面 App）的 PATH 可能只有系统四目录，
+                # 裸 npx 与 github shim 末端的 #!/usr/bin/env node 会 ENOENT 静默
+                # 失败（failOnStartupError: false）。显式钉住确定性 PATH，web 端
+                # launchd PATH 与此兼容，覆盖无副作用。
+                PATH: /Users/USER/.nvm/versions/node/v26.8.1/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+              failOnStartupError: false
+              toolCallTimeoutMs: 120000
+
+          # serena 停用（2026-09-02，用户决定：不常用）。
+          # 29 个工具 = 8,803 token，占 4 个 server 总量的 47%，是单个最贵的 server。
+          # 符号级重构由 grep / read / edit 覆盖。要恢复：删掉下面这行 disabled 即可。
+          - id: mcp-serena
+            disabled: true
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: serena
+              transport: stdio
+              command: /Users/USER/.local/bin/uvx
+              args: ['--from', 'serena-agent', 'serena', 'start-mcp-server', '--enable-web-dashboard', 'false', '--open-web-dashboard', 'false', '--log-level', 'WARNING', '--tool-timeout', '60']
+              env:
+                UV_CACHE_DIR: /Users/USER/.codex/.cache/uv-cache
+                UV_TOOL_DIR: /Users/USER/.codex/.cache/uv-tools
+              failOnStartupError: false
+              toolCallTimeoutMs: 120000
+
+          - id: mcp-github
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: github
+              transport: stdio
+              command: /Users/USER/.codex/bin/github-mcp-server
+              args: []
+              env:
+                # 2026-09-26：shim 本身全绝对路径，但末端 exec 的
+                # vendor mcp-server-github 是 #!/usr/bin/env node；GUI 宿主
+                # PATH 抽签可能缺 node。与 mcp-playwright 同一份确定性 PATH。
+                PATH: /Users/USER/.nvm/versions/node/v26.8.1/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+              failOnStartupError: false
+              toolCallTimeoutMs: 120000
+
+          # 2026-09-27：接入 Open Design（本机 /Applications/Open Design.app 0.24.1）
+          # 的无头 CLI/MCP。`od` 是包装脚本（~/.local/bin/od），会自动从
+          # Open Design 的 daemon-health.json 取 pid、用 lsof 找到 daemon 端口
+          # （GUI 启动时端口随机，如 58136），再转发到应用内置的 daemon-cli.mjs。
+          # `od mcp` 走 stdio MCP，官方用途：让外部编码 agent 拉取 Open Design
+          # 项目文件、创建项目内 artifact（免去每次导出 zip）。
+          # 设计稿生成仍由 Open Design 自己的 agent 跑，产出是 HTML 原型
+          # （template.html + data.json），再落地成 SwiftUI。
+          #
+          # 2026-09-27 实测结论：`od mcp` 启动即退出（rc=1、无输出）——它的
+          # server 在启动时就要 OD_TOOL_TOKEN（chunks/cli-*.mjs: `function toolToken()`
+          # 无 token 直接抛错），而该 token 由 Open Design 在「agent run」里注入，
+          # 外部进程拿不到，应用支持目录里也没有可读的 token 存储或签发端点。
+          # 因此这行先 disabled；等哪天能在应用内跑 agent（拿到 token）或官方
+          # 开放签发后再删掉 disabled。日常调用 Open Design 走 CLI 即可：
+          #   od tools directions / od artifacts create / od automation …
+          # 另一个实测现象（2026-09-27）：在 GUI 正运行时跑 `od mcp`，随后
+          # Open Design 的 daemon 以 code=0 退出（logs/daemon/latest.log：
+          # `[open-design packaged] exited app=daemon pid=15653`）。因果关系未坐实，
+          # 但建议不要在 App 打开状态下探测 `od mcp`。
+          - id: mcp-open-design
+            disabled: true
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: open-design
+              transport: stdio
+              command: /Users/USER/.local/bin/od
+              args: ['mcp']
+              env:
+                # 与 mcp-playwright / mcp-github 同一份确定性 PATH：GUI 宿主
+                # PATH 抽签时仍能解析 node（od 内部 exec 的 $OD_NODE_BIN/node）。
+                PATH: /Users/USER/.local/bin:/Users/USER/.nvm/versions/node/v26.8.1/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+              failOnStartupError: false
+              toolCallTimeoutMs: 180000
+
+          # 2026-10-22：接入 REA（morluto/rea，逆向工程 MCP，npm rea-agents 6.7.0）。
+          # DSH 不在 REA 官方支持的客户端列里（claude_code/codex/cursor/… 共 20 个，
+          # 无 dsh），故按通用 stdio 手工登记，不走 rea setup（那会去改别的客户端配置）。
+          # 安装：npm install --prefix ~/.dsh/vendor/rea-agent rea-agents@6.7.0
+          #       （148 个包 / 约 138 MB，自带与版本匹配的技能副本）。
+          # 用绝对 node + rea.mjs，不经 npx：实测 npx 首次冷启动 >150 秒（原生依赖
+          # prebuild-install），会撞宿主启动超时并静默失败（failOnStartupError: false）。
+          # 207 个工具全部非驻留（受 residentTools 门控），tool_gateway 用
+          # mcp__rea__* 或裸 mcp__rea 可一次解锁整族；tools/list 帧实测 3.27 MB，
+          # 不要设成常驻，否则 schema 会把上下文打爆。
+          # toolCallTimeoutMs 450000：Ghidra 冷启动默认 330 秒 + 操作余量（REA 官方口径）。
+          # REA_IDA_MCP_CONFIG 指向上游 mrexodia/ida-pro-mcp 1.4.0 的注册（attached 模式：
+          # 需要 IDA GUI 里开着原始二进制；1.4.0 没有 idb_open/idb_list/idb_close，
+          # 走不了 headless）。不设 REA_ANALYSIS_PROVIDER，交给它自动选引擎。
+          # 并存注意：本行与 mcp__ida-pro-mcp 都能驱动同一个 IDA GUI，同一时间只用一边。
+          - id: mcp-rea
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: rea
+              transport: stdio
+              command: /Users/USER/.nvm/versions/node/v26.12.1/bin/node
+              args:
+                - /Users/USER/.dsh/vendor/rea-agent/node_modules/rea-agents/scripts/rea.mjs
+                - mcp
+              env:
+                # 与 mcp-playwright / mcp-github 同一份确定性 PATH（钉当前 v26.12.1）；
+                # REA 还要用它找 ghidraRun（/opt/homebrew/bin）、jadx、adb 等外部引擎。
+                # 2026-10-22 实测：openjdk@21/bin 必须排在前面，PATH 里默认的 java 是
+                # openjdk@11（Ghidra 12.1.3 要求 min=21），用 11 时 REA 判定 Ghidra 不可用。
+                PATH: /opt/homebrew/opt/openjdk@21/bin:/Users/USER/.nvm/versions/node/v26.12.1/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+                JAVA_HOME: /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+                # Ghidra：brew 的 ghidraRun 只是壳，REA 要的是带 support/analyzeHeadless、
+                # Ghidra/application.properties 和 mac_arm_64 原生反编译器的解压目录。
+                # 走 /opt/homebrew/opt 稳定符号链接，brew 升级版本不失效（实测 12.1.3 = REA 要求的 12.1.x）。
+                GHIDRA_INSTALL_DIR: /opt/homebrew/opt/ghidra/libexec
+                # IDA：上游 mrexodia/ida-pro-mcp 1.4.0 的 attached 注册（REA 唯一 known working 版本）。
+                # 用 venv 里的 python 直跑 server.py，不走 --install-plugin 那个 shim。
+                REA_IDA_MCP_CONFIG: /Users/USER/.dsh/vendor/rea-agent/ida-mcp.json
+              failOnStartupError: false
+              toolCallTimeoutMs: 450000
+
+          # ── computer use：改用 dsh 自带实现（2026-10-28，dsh 0.2.2-alpha.2）──────────
+          # 已删除这里原有的两条 ZCode 逆向链路行（都指向 ~/projects/cua-server/
+          # run-mcp-server.sh，靠 ZCode.app 副本 + permission broker 的签名身份运作）：
+          #   1) mcp-client 行 mcp-computer-use（serverName: computer-use）；
+          #   2) computerUse 槽 isolate 组里的 experimental-computer-use-cua-driver-mcp。
+          # 证据链见 ~/.dsh/dsh-session-records/2026-09-15-browser-use-computer-use-wiring.md。
+          #
+          # computer use 现在由官方 @deepseek-ai/dsh-cua-bundle 提供，挂在 desktop
+          # profile 层、不在预设层：registry（@deepseek-ai/dsh-computer-use）
+          # + @deepseek-ai/dsh-experimental-cua-macos provider + @deepseek-ai/dsh-cua
+          # 客户端（应用授权 UI，本预设无法提供）。0.2.2 的 provider 用 config.agentPreset
+          # 决定给哪些 preset 的 agent 注册工具与指引；profile 里配成 false（全局），
+          # 所以本预设不再需要自带 computerUse 槽，也就不再需要 isolate 组规避
+          # “row(s) published process-global service(s)” 审计。
+
+
+          # blender-mcp（2026-09-08 新增）：社区 MCP for Blender，让 AI 控制 Blender。
+          # 使用前提：Blender 内已安装并启用 addon「Interface: MCP for Blender」
+          # （已安装到 5.2 scripts/addons/blender_mcp.py），并点击 Start MCP Server。
+          # 由 DSH 通过 uvx 启动 MCP server，工具名形如 mcp__blender__*。
+          #
+          # 2026-09-22 恢复：索引承诺 mcp__blender__* 可解锁，停用使其永远落空
+          # （实测 No tools match）。握手实测 32 个工具（get_scene_info /
+          # get_object_info / get_viewport_screenshot…，探针 2026-09-22）。
+          # 前提仍是 Blender 内 MCP for Blender addon 已 Start；addon 未启动时
+          # 工具调用会失败但 server 侧 tools/list 正常，failOnStartupError: false
+          # 保证不拖垮预设挂载。
+          # 2026-09-26：按用户要求停用（需要时把下面 `disabled: true` 那一行删掉即可）。
+          #   实测内存 100 MB（uvx 包装 28 + python 服务端 72）。
+          - id: mcp-blender
+            disabled: true
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: blender
+              transport: stdio
+              command: /Users/USER/.local/bin/uvx
+              args: ['blender-mcp']
+              failOnStartupError: false
+              toolCallTimeoutMs: 120000
