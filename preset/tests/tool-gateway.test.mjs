@@ -195,6 +195,21 @@ test('unknown non-Chinese keys are named too, and valid keys stay untouched', as
   assert.match(ok.text, /gateway tools/)
 })
 
+test('a settled call without a result returns an empty completion instead of throwing', async () => {
+  const f = fixture()
+  f.tools.execute = async () => ({ results: [{}] })
+  const out = await f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} })
+  assert.match(out.text, /completed with no output/)
+  f.tools.execute = async () => ({ results: [{ content: [{ type: 'text', text: 'kept' }] }] })
+  const kept = await f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} })
+  assert.equal(kept.text, 'kept')
+  f.tools.execute = async () => ({ results: [{ isError: true, error: { message: 'boom' } }] })
+  await assert.rejects(
+    f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} }),
+    /boom/,
+  )
+})
+
 test('call delegates through tools.execute with a private tool set', async () => {
   const f = fixture()
   const agent = { id: 'a' }

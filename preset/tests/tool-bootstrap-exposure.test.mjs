@@ -172,3 +172,69 @@ test('a global tool restricted away from the agent catalog is not gateway-eligib
   hooks.get('session/event')?.(session, { type: 'agent/inbox/spliced' })
   assert.equal(isGatewayEligible(definition), false)
 })
+
+test('tools/change re-reads the catalog so a late global tool still gets marked', async () => {
+  const bash = {
+    name: 'bash', description: 'shell',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({}),
+  }
+  const gatewayDefinition = {
+    name: 'tool_gateway', description: 'gateway',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({}),
+  }
+  const late = {
+    name: 'mcp__late__probe', description: 'registered after the first sync',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => ({}),
+  }
+  const registrations = new Map([
+    [bash.name, { definition: bash, when: undefined }],
+    [gatewayDefinition.name, { definition: gatewayDefinition, when: undefined }],
+  ])
+  // The agent scope materialised before the late plugin registered: it never
+  // lists that name, so only the refreshed catalog can admit it.
+  const agentRegistrations = new Map(registrations)
+  const tools = {
+    register() { return () => {} },
+    view(scope) {
+      const source = scope === undefined ? registrations : agentRegistrations
+      const visible = new Map([...source].map(([name, entry]) => [name, entry.definition]))
+      return { visible, registrations: source, knownNames: new Set(visible.keys()), restrictableNames: new Set(visible.keys()) }
+    },
+    schemas() { return [...registrations.values()].map(entry => entry.definition) },
+    restrict() { return () => {} },
+  }
+  const id = `late-registration-${Date.now()}`
+  const session = Session.create(id, [], {
+    version: SESSION_FORMAT_VERSION,
+    id,
+    createdAt: Date.now(),
+    isSeeded: false,
+    agentPreset: 'lean',
+  })
+  const agent = { session, ctx: { tools } }
+  const hooks = new Map()
+  bootstrap({
+    on: (name, fn) => hooks.set(name, fn),
+    logger: { warn() {} },
+    get: name => name === 'tools' ? tools : name === 'agents' ? { get: () => agent, list: () => [agent] } : undefined,
+  }, {
+    bootstrapTools: ['bash', 'tool_gateway'],
+    residentTools: ['bash', 'tool_gateway'],
+    compactionTools: ['bash', 'tool_gateway'],
+    subagentResidentTools: ['bash', 'tool_gateway'],
+    subagentCompactionTools: ['bash', 'tool_gateway'],
+  })
+  hooks.get('session/event')?.(session, { type: 'turn/end' })
+  assert.equal(isGatewayEligible(late, agent), false, 'the first sync cannot know about the late tool')
+
+  registrations.set(late.name, { definition: late, when: undefined })
+  hooks.get('tools/change')?.()
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(isGatewayEligible(late, agent), true, 'tools/change must refresh the cached catalog before re-marking')
+})

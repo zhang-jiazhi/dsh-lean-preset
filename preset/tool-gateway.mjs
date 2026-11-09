@@ -72,8 +72,22 @@ const privateToolSet = (definitions, agent) => ({
 
 /** Preserve the hidden tool's canonical content, including image/file blocks. */
 const resultValue = (settled) => {
-  const result = settled?.results?.[0]?.result
-  if (result === undefined) throw new Error('tool produced no result')
+  const entry = settled?.results?.[0]
+  const result = entry?.result
+  // Observed 20261109: some local tools (skill_search / skill_load) settle with
+  // no `result` at all. Throwing "tool produced no result" dead-ended the call
+  // and the model retried it; the settled entry may still carry content, and an
+  // empty completion is a valid outcome for a side-effecting tool.
+  if (result === undefined) {
+    const content = Array.isArray(entry?.content) ? entry.content : []
+    const text = content
+      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')
+    if (content.length > 0) return { content, ...(text.length > 0 ? { text } : {}) }
+    if (entry?.isError === true) throw new Error(textOf(entry.error?.message) || 'tool failed')
+    return { text: '(tool completed with no output)' }
+  }
   const content = Array.isArray(result.content) ? result.content : undefined
   const text = (content ?? [])
     .filter((block) => block?.type === 'text' && typeof block.text === 'string')

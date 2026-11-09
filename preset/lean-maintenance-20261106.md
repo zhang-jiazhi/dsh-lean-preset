@@ -97,3 +97,32 @@ compaction / rules-hybrid）指回旧入口，然后重启宿主。不要只改�
 - 批量 gateway 的**部分**失败外层仍是 success（宿主 `createSuccessResult` 忽略返回的
   `isError`）；结果文本带 `BATCH PARTIAL FAILURE: x/y`，全部失败才抛错。统计脚本
   按该标记单独计入批次失败。
+
+## 20261109 实会话修复
+
+来自 11-09 的 11 个 lean 会话（含 REA/逆向类）日志的错误归因：
+
+- **`not gateway-eligible`死角（`job_output`、`mcp__ida__*`）**：`tools/change`
+  的重同步用 `refresh=false`，`visibleNames` 可能是注册前的目录快照，晚注册/重注册的
+  工具被跳过、拿不到标记 → 模型看不到、网关又拒绝。现在改为 `refresh=true`：先重读
+  目录再打标。入口 `tool-bootstrap-entry-20261109-toolschange.mjs`，
+  回归 `tools/change re-reads the catalog so a late global tool still gets marked`
+  （已验证修复前失败、修复后通过）。
+- **`tool produced no result`（3 次）**：`skill_search` / `skill_load` 以无 `result` 的
+  settled 结构返回（本地技能插件在目录为空时不返回值）。gateway 以前直接抛错并让模型
+  重试；现在按 `content` 兜底，完全空则返回 `(tool completed with no output)`，只有真
+  错误才抛。入口 `tool-gateway-entry-20261109-observed4.mjs`。
+- **`invalid justification` / `sandbox escalation ... not strictly wider`（各 2 次）**：
+  归一化原先只挂在 `tools/execute`，而 `dsh-sandbox` 在 `tools/pre-execute` 就先校验
+  （`dsh-tools/lib/pipeline.js:386` 早于 `:492`），于是空 justification 与非更宽升级
+  根本到不了归一化。现在同一归一化以 `prepend` 挂到 `tools/pre-execute`，`tools/execute`
+  保留兜底。入口 `tool-call-normalizer-entry-20261109-normalize.mjs`。
+- **`child LLM provider must be non-empty`（4 次）**：同一时序问题的另一表现——
+  `provider:""` 在 pre-execute 前未被删除，宿主 `assertNonEmpty` 直接拒绝。上面的时序
+  修复同时覆盖，新增 `tests/normalizer-order.test.mjs` 固定顺序契约。
+
+仍未修复、需要宿主侧处理：
+
+- 标记仍按 definition 对象身份存（`WeakSet`/`WeakMap`）：工具整个换掉定义对象时，
+  旧标记随旧对象一起失效。`tools/change` 刷新目录已覆盖"新注册"这一路；如果还出现
+  同名换定义的丢失，再考虑把标记改按名称存（需处理同名换定义的代际校验）。

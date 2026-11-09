@@ -165,11 +165,26 @@ export function apply(ctx) {
       return undefined
     }
   }
-  ctx.on('tools/execute', async (exec, next) => {
+  const normalizeExec = (exec) => {
     if (exec !== null && typeof exec === 'object' && exec.arguments !== null && typeof exec.arguments === 'object') {
       const normalized = normalizeToolArguments(exec.name, exec.arguments, effectiveModeOf(exec))
       if (normalized !== exec.arguments) exec.arguments = normalized
     }
+  }
+  // 20261109-live：`tools/pre-execute` runs BEFORE `tools/execute`
+  // (dsh-tools/lib/pipeline.js:386 vs :492) and `dsh-sandbox` validates
+  // `sandbox_permissions` / `justification` there. Normalizing only in
+  // `tools/execute` therefore came too late: real sessions still failed with
+  // "invalid justification: expected a non-empty sentence" and "sandbox
+  // escalation ... is not strictly wider". Registering first (prepend) on the
+  // earlier seam fixes the ordering; the later hook stays as a backstop for
+  // executors that bypass pre-execute.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    normalizeExec(exec)
+    return next()
+  }, { prepend: true })
+  ctx.on('tools/execute', async (exec, next) => {
+    normalizeExec(exec)
     const result = await next()
     let hint
     if (exec?.name === 'bash') hint = bashHintFor(result)

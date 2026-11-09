@@ -367,7 +367,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
   const guardSleep = source.guardSleep !== false
   // Creating a *new* workspace file cannot invalidate read evidence, so bash may
   // create it (2026-11-01: strict new-file blocking measured 20.1% of bash calls
-  // in session-example-b, mostly one-off probe scripts). Set true to block those.
+  // in session-example, mostly one-off probe scripts). Set true to block those.
   const guardNewFileWrites = source.guardNewFileWrites === true
   // Middle state: `sed -i` / `cat >` / `tee` on existing files are allowed; only
   // scripted interpreter writes are blocked. `guardShellWrites: true` restores
@@ -556,7 +556,7 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
    * The Agent Team plugin's own lead declaration, injected as a
    * `runtime-context` snapshot at session start (2026-10-31).
    *
-   * Measured in session-example-b (216 steps): the runtime snapshot told the
+   * Measured in session-example (216 steps): the runtime snapshot told the
    * model "You are the Team Lead named lead … use list_agents/send_message",
    * but the catalog had no Team tools because the first user message was just
    * two file paths. The model then spent a round calling `tool_gateway` with
@@ -1291,7 +1291,11 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     queueMicrotask(() => {
       toolsChangeScheduled = false
       const currentAgents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
-      for (const agent of currentAgents?.list?.() ?? []) syncExposure(agent.session, false)
+      // 20261109-toolschange：refresh=true。以前这里读缓存目录，`visibleNames`
+      // 可能是注册前的快照，导致晚注册/重注册的工具被跳过、拿不到 eligibility
+      // 标记 —— 模型既看不到、网关又说 not gateway-eligible，成了死角
+      // （实测：job_output、mcp__ida__list_databases）。
+      for (const agent of currentAgents?.list?.() ?? []) syncExposure(agent.session, true)
     })
   })
 
