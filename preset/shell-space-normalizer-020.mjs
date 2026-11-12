@@ -14,7 +14,7 @@
  * keeps running; its end arrives as a message. An explicit model timeout is
  * honoured (up to the executor cap), so a deliberate long wait still works.
  *
- * Measured in session-example-b: 582 bash calls, p95 59.8 s, 42 calls > 30 s,
+ * Measured in session-example: 582 bash calls, p95 59.8 s, 42 calls > 30 s,
  * 30 > 60 s, 82.7 minutes of foreground waiting in one session.
  *
  * shell-space-normalizer (0.1.7 executor API) — isolated wrapper for the

@@ -19,7 +19,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { access, readFile } from 'node:fs/promises'
 import { runtimeRequire } from './runtime-helper.mjs'
-import { UNLOCKABLE_INDEX } from '../dev-tool-search.mjs'
+import { TOOL_BUNDLES, UNLOCKABLE_INDEX } from '../dev-tool-search.mjs'
 
 const { entryListSchema } = runtimeRequire('@deepseek-ai/cordis-plugin-include')
 const allRows = (rows) => rows.flatMap(row => (row.config && Array.isArray(row.config) ? allRows(row.config) : [row]))
@@ -51,6 +51,7 @@ const HOST_LAYER_TOOLS = [
   { prefix: 'terminal_', registrar: 'dsh-base terminal-bash (terminal_open/send/read/signal/close/list)' },
   { prefix: 'translate_', registrar: '@dsh-external/dsh-immersive-translate (translate_text / translate_page)' },
   { prefix: 'job_', registrar: 'dsh-base tool-jobs (job_list / job_output / job_kill)' },
+  { prefix: 'user_terminal_', registrar: '@deepseek-ai/dsh-terminal-panel (desktop 0.2.2-rc.2; terminal panel user sessions)' },
   { tools: ['create_worktree', 'working_directory', 'load_workspace_dependencies'], registrar: 'dsh-base working-directory / experimental-tool-worktree' },
   { tools: ['search_history', 'history_context', 'search_provider_status'], registrar: '@local/example-search-history + @local/example-search-aggregator' },
   { tools: ['list_subagent_models'], registrar: '@deepseek-ai/dsh-tool-subagent (model selection)' },
@@ -180,4 +181,61 @@ test('every local preset entry referenced by lean.patch.yml exists', async () =>
       `entry ${row.name} is referenced but missing on disk`,
     )
   }
+})
+
+// A server can be disabled at the preset layer OR at the profile layer; rc.2
+// disabled the browser-use provider in the profile, so a preset-only scan would
+// miss the very case this guard exists for. The profile file is optional: the
+// check still runs on machines that only carry the preset.
+const profileDisabledServers = async () => {
+  const { readFile } = await import('node:fs/promises')
+  const { existsSync } = await import('node:fs')
+  const { homedir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = process.env.DSH_PROFILE_DIR ?? join(homedir(), '.dsh', 'profiles', 'desktop')
+  const file = join(dir, 'cordis.patch.yml')
+  if (!existsSync(file)) return []
+  const rows = runtimeRequire('js-yaml').load(await readFile(file, 'utf8'), { schema: entryListSchema })
+  const flatten = entries => entries.flatMap(entry => [
+    entry,
+    ...flatten(Array.isArray(entry?.config) ? entry.config : []),
+    ...flatten(Array.isArray(entry?.config?.plugins) ? entry.config.plugins : []),
+  ])
+  return flatten(rows.flatMap(row => row.insert ?? []))
+    .filter(row => row.name === '@deepseek-ai/dsh-mcp-client' && row.disabled === true)
+    .map(row => row.config?.serverName)
+    .filter(server => typeof server === 'string')
+}
+
+test('the playwright bundle targets the MCP server this composition enables', async () => {
+  const row = presetRows.find(entry => entry.id === 'mcp-playwright')
+  assert.ok(row, 'the mcp-playwright row must exist')
+  assert.notEqual(row.disabled, true, 'the browser capability must stay enabled')
+  const server = row.config.serverName
+  // 0.2.2-rc.2 disabled the browser-use playwright-mcp provider, so a bundle
+  // naming that namespace expands to nothing and the model sees "No tools match".
+  assert.equal(TOOL_BUNDLES.playwright.every(name => name.startsWith(`mcp__${server}__`)), true,
+    `bundle names must stay under mcp__${server}__`)
+  const disabledServers = [
+    ...presetRows.filter(entry => entry.name === '@deepseek-ai/dsh-mcp-client' && entry.disabled === true)
+      .map(entry => entry.config.serverName),
+    ...(await profileDisabledServers()),
+  ]
+  for (const name of TOOL_BUNDLES.playwright) {
+    for (const off of disabledServers) assert.ok(!name.startsWith(`mcp__${off}__`), `${name} targets a disabled MCP server`)
+  }
+})
+
+test('the gateway family index never advertises a disabled MCP server', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../tool-gateway.mjs', import.meta.url), 'utf8')
+  const disabledServers = [
+    ...presetRows.filter(entry => entry.name === '@deepseek-ai/dsh-mcp-client' && entry.disabled === true)
+      .map(entry => entry.config.serverName),
+    ...(await profileDisabledServers()),
+  ]
+  for (const server of disabledServers) {
+    assert.ok(!source.includes(`mcp__${server}__`), `gateway index still promises disabled server ${server}`)
+  }
+  assert.ok(source.includes('mcp__playwright-persist__'), 'gateway index must name the mounted Playwright family')
 })

@@ -17,7 +17,8 @@ export const name = 'tool-gateway'
 /** The tool registry must exist before this tool can register. */
 export const inject = ['tools']
 
-import { isGatewayEligible, originalWhenFor } from './gateway-policy.mjs?release=20261106-fixes'
+import { isGatewayEligible } from './gateway-policy.mjs?release=20261106-fixes'
+import { projectReaStatus } from './rea-status-output.mjs?release=20261110-scoped2'
 
 const GATEWAY_NAME = 'tool_gateway'
 const MAX_LIST = 80
@@ -35,59 +36,64 @@ const clip = (value, limit = MAX_DESCRIPTION) => {
   return text.length <= limit ? text : `${text.slice(0, limit - 3)}...`
 }
 
-/** Build the private catalog: global registrations plus this agent's scoped ones. */
+/** Eligibility describes LEAN hiding, not admission by the current Agent scope. */
+const eligibleRegistration = (name, registration, agent) => registration !== undefined
+  && registration.when === undefined
+  && (isGatewayEligible(registration.definition, agent) || GATEWAY_ALWAYS.has(name))
+
+/** Never merge a global fallback over restrictions or a conditional scoped shadow. */
 const catalogFor = (ctx, agent) => {
   const definitions = new Map()
   const direct = new Set()
   const conditional = new Set()
-  const add = (entries) => {
-    for (const [name, definition] of entries) {
-      if (name === GATEWAY_NAME) continue
-      if (!isGatewayEligible(definition, agent) && !GATEWAY_ALWAYS.has(name)) {
-        direct.add(name)
-        continue
-      }
-      // A definition with its own `when` stays out: no step modelSelection here.
-      // Remember the name so a search/describe can explain the exclusion
-      // instead of dead-ending on "no match" (e.g. web_search).
-      if (originalWhenFor(definition) !== undefined) {
-        conditional.add(name)
-        continue
-      }
-      definitions.set(name, definition)
+  const registrations = ctx.tools.view(agent).registrations
+  if (!(registrations instanceof Map)) throw new Error('tool registry does not expose effective registrations')
+  for (const [name, registration] of registrations) {
+    if (name === GATEWAY_NAME) continue
+    if (!isGatewayEligible(registration.definition, agent) && !GATEWAY_ALWAYS.has(name)) {
+      direct.add(name)
+      continue
     }
+    // Conditions belong to this registration, not a shared definition object.
+    // The gateway has no modelSelection with which to evaluate them truthfully.
+    if (registration.when !== undefined) {
+      conditional.add(name)
+      continue
+    }
+    definitions.set(name, registration.definition)
   }
-  add(ctx.tools.view().visible)
-  if (agent !== undefined && agent !== null) add(ctx.tools.view(agent).visible)
   return { definitions, direct, conditional }
 }
 
-/** A step-like tool set accepted by ctx.tools.execute(). */
-const privateToolSet = (definitions, agent) => ({
+/** Recheck admission after pre-execute/approval; a captured definition is not authority. */
+const privateToolSet = (ctx, definitions, agent) => ({
   dispose() {},
   view(scope) {
-    return scope === agent ? definitions : new Map()
+    const admitted = new Map()
+    if (scope !== agent) return admitted
+    const current = ctx.tools.view(agent).registrations
+    if (!(current instanceof Map)) return admitted
+    for (const [name, definition] of definitions) {
+      const registration = current.get(name)
+      if (registration?.definition === definition && eligibleRegistration(name, registration, agent)) {
+        admitted.set(name, definition)
+      }
+    }
+    return admitted
   },
 })
 
+const canonicalResultAt = (settled, index) => {
+  const result = Array.isArray(settled?.results) ? settled.results[index]?.result : undefined
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    throw new Error(`tool result protocol error: missing canonical results[${index}].result; outcome unknown — inspect before retrying`)
+  }
+  return result
+}
+
 /** Preserve the hidden tool's canonical content, including image/file blocks. */
 const resultValue = (settled) => {
-  const entry = settled?.results?.[0]
-  const result = entry?.result
-  // Observed 20261109: some local tools (skill_search / skill_load) settle with
-  // no `result` at all. Throwing "tool produced no result" dead-ended the call
-  // and the model retried it; the settled entry may still carry content, and an
-  // empty completion is a valid outcome for a side-effecting tool.
-  if (result === undefined) {
-    const content = Array.isArray(entry?.content) ? entry.content : []
-    const text = content
-      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-      .map((block) => block.text)
-      .join('\n')
-    if (content.length > 0) return { content, ...(text.length > 0 ? { text } : {}) }
-    if (entry?.isError === true) throw new Error(textOf(entry.error?.message) || 'tool failed')
-    return { text: '(tool completed with no output)' }
-  }
+  const result = canonicalResultAt(settled, 0)
   const content = Array.isArray(result.content) ? result.content : undefined
   const text = (content ?? [])
     .filter((block) => block?.type === 'text' && typeof block.text === 'string')
@@ -116,17 +122,21 @@ const resultValue = (settled) => {
  * error statistics see a real failure instead of a success text.
  */
 const batchResult = (settled, names) => {
-  const results = Array.isArray(settled?.results) ? settled.results : []
   const content = []
   const sections = []
   const failed = []
+  const statuses = []
   for (let index = 0; index < names.length; index += 1) {
     const name = names[index]
-    const result = results[index]?.result
     const label = `## ${name}`
-    if (result === undefined) {
-      const body = 'ERROR: tool produced no result'
-      failed.push({ name, message: 'tool produced no result' })
+    let result
+    try {
+      result = canonicalResultAt(settled, index)
+    } catch (error) {
+      const message = error.message
+      const body = `ERROR: ${message}`
+      failed.push({ name, message })
+      statuses.push({ index, name, status: 'error', message })
       content.push({ type: 'text', text: `${label}\n${body}` })
       sections.push(`${label}\n${body}`)
       continue
@@ -138,10 +148,12 @@ const batchResult = (settled, names) => {
         .join('\n')
       const message = textOf(result.error?.message) || raw || 'tool failed'
       failed.push({ name, message })
+      statuses.push({ index, name, status: 'error', message })
       content.push({ type: 'text', text: `${label}\nERROR: ${message}` })
       sections.push(`${label}\nERROR: ${message}`)
       continue
     }
+    statuses.push({ index, name, status: 'ok' })
     const blocks = Array.isArray(result.content) ? result.content : []
     const text = blocks
       .filter((block) => block?.type === 'text' && typeof block.text === 'string')
@@ -159,11 +171,12 @@ const batchResult = (settled, names) => {
   if (failed.length === names.length) {
     throw new Error(`batch failed: all ${names.length} call(s) failed — ${failed.map((item) => `${item.name}: ${item.message}`).join('; ')}`)
   }
-  if (failed.length === 0) return { text: sections.join('\n\n'), content }
+  if (failed.length === 0) return { text: sections.join('\n\n'), content, statuses }
   const summary = `BATCH PARTIAL FAILURE: ${failed.length}/${names.length} calls failed (${failed.map((item) => item.name).join(', ')}). Failed items are labeled ERROR above; retry only those.`
   return {
     content: [{ type: 'text', text: summary }, ...content],
     text: `${summary}\n\n${sections.join('\n\n')}`,
+    statuses,
   }
 }
 
@@ -386,7 +399,7 @@ const directToolText = (toolName) => (TEAM_TOOLS.has(toolName)
   : `"${toolName}" is not gateway-eligible. If it is visible in your tool list, call it directly; otherwise it is unavailable.`)
 
 /** Argument keys the gateway accepts; anything else is a malformed call. */
-const GATEWAY_ARG_KEYS = new Set(['action', 'name', 'input', 'calls', 'query', 'offset'])
+const GATEWAY_ARG_KEYS = new Set(['action', 'name', 'input', 'calls', 'query', 'offset', 'full_output'])
 
 /** Common keys the model emits when it translates this schema into Chinese. */
 const ARG_ALIASES = new Map([
@@ -405,7 +418,7 @@ const malformedArgumentsText = (args, unknown) => {
   const mapped = unknown.map(key => (ARG_ALIASES.has(key) ? `${key} → ${ARG_ALIASES.get(key)}` : key))
   const sample = JSON.stringify({ action: 'call', name: '<tool>', input: {} })
   return `unrecognized argument key(s): ${mapped.join(', ')}. `
-    + `tool_gateway accepts only action / name / input / calls / query / offset, spelled in ASCII `
+    + `tool_gateway accepts only action / name / input / calls / query / offset / full_output, spelled in ASCII `
     + `(JSON strings use straight double quotes, not “ ”). Retry with e.g. ${sample}.`
 }
 
@@ -456,11 +469,15 @@ const definition = (ctx) => ({
     'If arguments are unknown, use action="describe" with name first, then action="call" with the exact name and input. The call still goes through normal approval and policy.',
     '',
     'Family index (approximate; action="list" is authoritative — anything absent is NOT reachable here):',
-    'browser_* sidebar browser; mcp__playwright-mcp__* when unlocked; memory_*; session_* + search_history/history_context;',
+    // 0.2.2-rc.2: the browser-use playwright-mcp provider is disabled in the
+    // desktop profile; the only mounted Playwright family is mcp-playwright's
+    // persistent profile. Promising the disabled server cost a dead search.
+    'browser_* sidebar browser; mcp__playwright-persist__* (logged-in profile) when unlocked; user_terminal_*; memory_*; session_* + search_history/history_context;',
     'terminal_*; search aggregator (tavily_search/anysearch_search/exa_search/deepseek_search/deepseek_fetch/search_provider_status);',
     'workflow_*; goal tools (create_goal/get_goal/update_goal); jobs (job_list/job_output/job_kill);',
     'dev_* (plugin build/inject/stage/patch/heal/reload/self-test); create_worktree; cua; apply_patch (one-call multi-file patch); batch; ralph; propose_action;',
     'grep, glob (content and filename search; moved out of the resident set); skill_search / skill_load (on-demand skills); load_workspace_dependencies; working_directory.',
+    'REA: use the live mcp__rea__ catalog, not guessed IDA names or repeated doctor/setup. Large binary_session status is summarized with a complete result reference; full_output=true bypasses that summary.',
   ].join('\n'),
   parameters: {
     type: 'object',
@@ -475,6 +492,7 @@ const definition = (ctx) => ({
       offset: { type: 'integer', minimum: 0, description: 'Paging offset for list (default 0); the footer prints the next offset.' },
       name: { type: 'string', description: 'Exact gateway-eligible tool name for describe/call.' },
       input: { type: 'object', additionalProperties: true, description: 'Arguments object for the hidden tool.' },
+      full_output: { type: 'boolean', description: 'Bypass the LEAN REA status summary; Host spill limits still apply.' },
       calls: {
         type: 'array',
         maxItems: 8,
@@ -491,8 +509,21 @@ const definition = (ctx) => ({
       properties: {
         text: { type: 'string' },
         content: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        statuses: {
+          type: 'array',
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              index: { type: 'integer' }, name: { type: 'string' },
+              status: { type: 'string', enum: ['ok', 'error'] }, message: { type: 'string' },
+            },
+            required: ['index', 'name', 'status'],
+          },
+        },
       },
     },
+    // Partial batches retain success content; expose per-call outcomes in durable meta.
+    presentationMeta: (_args, value) => value.statuses === undefined ? {} : { gatewayCalls: value.statuses },
     render: (_args, value) => (
       Array.isArray(value.content) && value.content.length > 0
         ? value.content
@@ -509,6 +540,7 @@ const definition = (ctx) => ({
       if (unknown.length > 0) throw new Error(malformedArgumentsText(args, unknown))
     }
     const action = args?.action ?? (Array.isArray(args?.calls) ? 'call' : undefined)
+    if (args?.full_output !== undefined && typeof args.full_output !== 'boolean') throw new Error('full_output must be a boolean.')
     if (Array.isArray(args?.calls) && action !== 'call') {
       throw new Error('calls only applies to action="call".')
     }
@@ -572,11 +604,12 @@ const definition = (ctx) => ({
       }],
       agent: exec.agent,
       signal: exec.signal,
-      toolSet: privateToolSet(definitions, exec.agent),
+      toolSet: privateToolSet(ctx, definitions, exec.agent),
     })
-    for (const context of settled.additionalContexts ?? []) exec.deferContext(context)
-    if (settled.concluded === true) exec.concludeTurn()
-    return resultValue(settled)
+    for (const context of settled?.additionalContexts ?? []) exec.deferContext(context)
+    if (settled?.concluded === true) exec.concludeTurn()
+    const projected = await projectReaStatus(ctx, exec, toolName, canonicalResultAt(settled, 0), args.full_output)
+    return resultValue({ results: [{ result: projected }] })
 
     /** Validate every item first, then run them as one executor batch. */
     async function callBatch(items) {
@@ -612,11 +645,19 @@ const definition = (ctx) => ({
         })),
         agent: exec.agent,
         signal: exec.signal,
-        toolSet: privateToolSet(definitions, exec.agent),
+        toolSet: privateToolSet(ctx, definitions, exec.agent),
       })
-      for (const context of settled.additionalContexts ?? []) exec.deferContext(context)
-      if (settled.concluded === true) exec.concludeTurn()
-      return batchResult(settled, prepared.map(item => item.name))
+      for (const context of settled?.additionalContexts ?? []) exec.deferContext(context)
+      if (settled?.concluded === true) exec.concludeTurn()
+      if (!Array.isArray(settled?.results)) return batchResult(settled, prepared.map(item => item.name))
+      const projected = { results: [] }
+      for (let index = 0; index < prepared.length; index += 1) {
+        const entry = settled?.results?.[index]
+        projected.results.push(entry?.result !== undefined && entry.result !== null && typeof entry.result === 'object'
+          ? { ...entry, result: await projectReaStatus(ctx, exec, prepared[index].name, entry.result, args.full_output) }
+          : entry)
+      }
+      return batchResult(projected, prepared.map(item => item.name))
     }
   },
 })

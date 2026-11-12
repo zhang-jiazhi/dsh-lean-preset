@@ -1,12 +1,13 @@
-# lean 维护说明 — 20261106-fixes / 20261107-observed
+# lean 维护说明 — 20261110-catalog / 20261110-scoped2
 
 ## 本次入口
 
 `lean.patch.yml` 已指向：
 
-- `tool-bootstrap-entry-20261106-fixes.mjs` → `tool-bootstrap.mjs?release=20261106-fixes`
-- `tool-gateway-entry-20261107-observed3.mjs` → `tool-gateway.mjs?release=20261107-observed3`
-- `tool-call-normalizer-entry-20261106-fixes.mjs` → `tool-call-normalizer.mjs?release=20261106-fixes`
+- `tool-bootstrap-entry-20261110-catalog.mjs` → `tool-bootstrap.mjs?release=20261110-catalog`
+- `tool-gateway-entry-20261110-scoped2.mjs` → `tool-gateway.mjs?release=20261110-scoped2`
+- `skills-on-demand-entry-20261110-errors.mjs` → `skill-search.mjs?release=20261110-errors`
+- `tool-call-normalizer-entry-20261109-normalize.mjs` → `tool-call-normalizer.mjs?release=20261109-normalize`
 - `compaction-absolute-threshold-entry-20261106-fixes.mjs` → `compaction-absolute-threshold.mjs?release=20261106-fixes`
 - `rules-hybrid-entry-20261106-fixes.mjs` → `rules-hybrid.mjs?release=20261106-fixes`
 - gateway 与 bootstrap 的 `gateway-policy.mjs` 引用仍统一为 `?release=20261106-fixes`；只更新 gateway 实现 URL，不生成第二套 eligibility 表。
@@ -48,7 +49,7 @@ RESTART the host to finish this upgrade; new sessions may fail with
 1. 宿主日志出现：
 
 ```text
-anchored-tool-bootstrap: release 20261106-fixes active (resolve registry generation N)
+anchored-tool-bootstrap: release 20261110-catalog active (resolve registry generation N)
 N 是进程内的模块代号；新会话应大于旧会话的代号。
 ```
 
@@ -94,35 +95,78 @@ compaction / rules-hybrid）指回旧入口，然后重启宿主。不要只改�
 - `rules-hybrid.mjs` 的核心块（第 0 章）只在会话开始/压缩后注入一次；核心文件内容
   变化不会在每个 step 重新发送。专项规则可按 digest 更新；核心需要新会话、压缩或
   显式刷新入口（见 `rule_load` 的 `refreshCore`）。
-- 批量 gateway 的**部分**失败外层仍是 success（宿主 `createSuccessResult` 忽略返回的
-  `isError`）；结果文本带 `BATCH PARTIAL FAILURE: x/y`，全部失败才抛错。统计脚本
-  按该标记单独计入批次失败。
+- 批量 gateway 的**部分**失败外层仍是 success，保留成功内容和图片；结果文本带
+  `BATCH PARTIAL FAILURE: x/y`，全部失败才抛错。逐调用 `statuses` 同时写入
+  `meta.gatewayCalls`，统计不能只看外层 `isError`。返回 value 中增加 `isError`
+  并不能改变宿主的成功/失败语义。
 
-## 20261109 实会话修复
+## 20261109 记录的复核纠正
 
-来自 11-09 的 11 个 lean 会话（含 REA/逆向类）日志的错误归因：
+20261110 改用事件时间和真实 ASAR 注册表复核，不再把文件 mtime 当错误发生时间：
 
-- **`not gateway-eligible`死角（`job_output`、`mcp__ida__*`）**：`tools/change`
-  的重同步用 `refresh=false`，`visibleNames` 可能是注册前的目录快照，晚注册/重注册的
-  工具被跳过、拿不到标记 → 模型看不到、网关又拒绝。现在改为 `refresh=true`：先重读
-  目录再打标。入口 `tool-bootstrap-entry-20261109-toolschange.mjs`，
-  回归 `tools/change re-reads the catalog so a late global tool still gets marked`
-  （已验证修复前失败、修复后通过）。
-- **`tool produced no result`（3 次）**：`skill_search` / `skill_load` 以无 `result` 的
-  settled 结构返回（本地技能插件在目录为空时不返回值）。gateway 以前直接抛错并让模型
-  重试；现在按 `content` 兜底，完全空则返回 `(tool completed with no output)`，只有真
-  错误才抛。入口 `tool-gateway-entry-20261109-observed4.mjs`。
-- **`invalid justification` / `sandbox escalation ... not strictly wider`（各 2 次）**：
-  归一化原先只挂在 `tools/execute`，而 `dsh-sandbox` 在 `tools/pre-execute` 就先校验
-  （`dsh-tools/lib/pipeline.js:386` 早于 `:492`），于是空 justification 与非更宽升级
-  根本到不了归一化。现在同一归一化以 `prepend` 挂到 `tools/pre-execute`，`tools/execute`
-  保留兜底。入口 `tool-call-normalizer-entry-20261109-normalize.mjs`。
-- **`child LLM provider must be non-empty`（4 次）**：同一时序问题的另一表现——
-  `provider:""` 在 pre-execute 前未被删除，宿主 `assertNonEmpty` 直接拒绝。上面的时序
-  修复同时覆盖，新增 `tests/normalizer-order.test.mjs` 固定顺序契约。
+- 之前归入“今日 53 次”的会话是长历史会话；其空 provider、justification 错误实际
+  发生于 9 月。空 provider 的校验发生在子工具正文，不能归因为 sandbox 的
+  pre-execute 时序；当前 tools/execute 归一化已经覆盖空路由字段。
+- 正常空技能目录仍返回 canonical `result`。11-09 三次 `tool produced no result`
+  的历史 executor/envelope 尚未定位；“空目录不返回 result”的说法被真实实验否定。
+- 真实 `tools.view(agent)` 动态合并当前 global/scoped 注册。旧 false 也能标记
+  晚注册和同名重注册；true 修的是目录快照陈旧，原“scope 永远缺晚 global”的
+  mock 不符合当前宿主，已纠正并补真实接口覆盖。
+- pre-execute 的沙箱参数归一化保持不变；它早于 tools/execute 的执行顺序和
+  非更宽升级/空 justification 的防护继续受 normalizer 回归约束。
 
-仍未修复、需要宿主侧处理：
+## 20261110 修复与验证
 
-- 标记仍按 definition 对象身份存（`WeakSet`/`WeakMap`）：工具整个换掉定义对象时，
-  旧标记随旧对象一起失效。`tools/change` 刷新目录已覆盖"新注册"这一路；如果还出现
-  同名换定义的丢失，再考虑把标记改按名称存（需处理同名换定义的代际校验）。
+- 网关只取调用 Agent 的有效 registrations，不再合并 global fallback；条件读取
+  当前 registration.when，不使用跨 Agent 共享 definition 的 originalWhen 作授权。
+  私有 ToolSet 在执行时再次核对 registration/definition，覆盖审批前后撤销竞态。
+- 单/批调用共用 canonical result 解码。缺失 result 是协议错误，明确 outcome unknown，
+  不诱导盲目重跑有副作用的调用；技能服务真实异常保留 native failure。
+- schema 快照按 per-Agent registration identity + tools/change revision 失效。
+  变更即时失效、微任务合并刷新；相位/解锁仍每次重算 keep，不再每步深拷贝 schema。
+- REA 只压缩成功的 `binary_session` 完整状态 JSON，不改分析证据、图片或错误。
+  从未截断的 canonical value 提取状态，完整 payload 和原始 value 通过现有 spillStore
+  私有保存；摘要带 SHA-256、locator 和读取提示，预算 8k 字符。未知格式、已有短预览
+  或无存储服务保持原文，保存失败明确提示并保留原文。`full_output: true` 绕过
+  LEAN 摘要，但不取消宿主 spill 限制；保留/清理由现有 spillStore 管理。
+- 真实 ASAR 修复前回归：6 项中 5 项失败（scope deny、同名条件遮蔽、跨 Agent 条件、
+  pre-execute 撤销、技能异常误报）；修复后全部通过。缓存回归证明首次投影后 5 个
+  无变更 step/turn 同步不会再投影，late/scoped/remove/restrict 与 burst 刷新仍有效。
+- 同条件合成目录基准：383 工具、参数 JSON 1150B、5 波预热/21 波采样，无注册变更。
+  step/end 同步 p50：1 Agent 2.918→0.103ms，8 Agent 23.570→0.663ms，
+  32 Agent 93.983→2.606ms；8 Agent 的 schema 投影 168→0、view 调用 504→168。
+  这是合成基准，不是线上模型延迟。
+- 真实 REA 样本 + 当前 spillStore 验证：inline 49930→6438 字符；未截断源为
+  54311 字符，完整原始 value/payload 和 server identity 校验一致，文件 0600、
+  SHA-256 校验通过。N=1，不代表所有目标/版本的压缩率，也未执行目标分析。
+- 只更改本地预设及回归，发布副本未改。当前运行中的 20261109 模块不会因文件写入
+  自动换代；新入口可加载不等于在线已激活，受控重启后的入口核验仍需单独完成。
+
+## 20261112 与 0.2.2-rc.2 的匹配核对
+
+- 实际宿主：`@deepseek-ai/dsh-desktop 0.2.2-rc.2`、`dsh-tools 0.2.2-rc.2`；
+  进程启动晚于应用更新时间，当前会话已装载 20261110 三条入口，`broken=null`、
+  `leakedServices=[]`。完整回归 **397/397**（rc.2 ASAR）。
+- 目录：注册 364 个工具（REA 207、github 26、playwright-persist 23…），常驻 13 项全在。
+  同一会话 20 个 `request/header` 中工具数上限 23，未出现目录泄漏；
+  rc.2 仍未实现 `deferLoading`（仅类型声明），gateway 方案继续成立。
+- 真实失配（已修）：桌面 profile 自 2026-11-01 停用 browser-use 的
+  `experimental-browser-use-playwright-mcp`，live 目录只剩
+  `mcp__playwright-persist__*`（23）。但 gateway family index 与
+  `TOOL_BUNDLES.playwright` 仍写 `mcp__playwright-mcp__*`（24），搜索/解锁会
+  得到空结果。现在两者都指向实际 serverName（`mcp__playwright-persist__`）。
+- rc.2 新增 `dsh-terminal-panel` 的 `user_terminal_list/read`；已补入能力索引和
+  `HOST_LAYER_TOOLS`（gateway 侧只列家族名，不加常驻、不改权限）。
+- 新增静态回归：bundle 名字必须落在**预设层**启用的 MCP server 前缀下，且 gateway
+  文本不得提已禁用的 server；禁用清单同时扫描预设层与 profile 层
+  （`DSH_PROFILE_DIR` 缺省 `~/.dsh/profiles/desktop`，文件不存在时跳过）。
+  变异验证：把 gateway 索引改回旧名，两条回归都报错；改回即通过。
+- 对抗审核发现的缺口（已修）：首版只扫描预设层，而本次真实故障源（browser-use
+  provider）是在 profile 层停用的。仅靠“必须包含 mcp__playwright-persist__”的正向断言
+  能拦住回退，但拦不住“另一台在 profile 停用的 server 被写进索引”。
+- 未改的取舍：`keptSections` 仍只保留 jobs/apply_patch/subagent*；rc.2 的
+  `tool:pty`、`tool:pty-panel`、`tool:schedule` 属隐藏工具的说明，常驻会增加
+  每步开销，故不入白名单。
+- 注意：`dev-tool-search` 插件当前**未挂载**（live 目录无 `dev_tool_search`），
+  `TOOL_BUNDLES`/`UNLOCKABLE_INDEX` 只影响测试与静态契约；真正对模型生效的是
+  gateway 描述。新入口 `tool-gateway-entry-20261112-rc2.mjs` 需重启后生效。

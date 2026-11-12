@@ -164,7 +164,8 @@ export function apply(ctx) {
         const extra = matches.length > MAX_RESULTS ? `\n…(${matches.length - MAX_RESULTS} more)` : ''
         return { text: `Matching skills (${matches.length}):\n${lines.join('\n')}${extra}\n\nLoad one with skill_load (exact name).` }
       } catch (error) {
-        return { text: `skill_search unavailable: ${String((error && error.message) || error)}` }
+        // Provider faults are failures; only a normal no-match is successful.
+        throw error
       }
     },
   })
@@ -182,7 +183,7 @@ export function apply(ctx) {
     async execute(args, exec) {
       try {
         const agent = exec?.agent
-        if (!agent?.session) return { text: 'skill_load requires an agent context.' }
+        if (!agent?.session) throw new Error('skill_load requires an agent context.')
         const skill = await ctx.skills.get(args.name, {
           scope: agent,
           cwd: agent.session.header.cwd,
@@ -225,7 +226,8 @@ export function apply(ctx) {
         if (!replaced) agent.inject(message)
         return { text: `Skill "${skillName}" loaded; use the applicable workflow and continue the original task.` }
       } catch (error) {
-        return { text: `skill_load failed: ${String((error && error.message) || error)}` }
+        // Preserve native error/cancellation classification and the original cause.
+        throw error
       }
     },
   })

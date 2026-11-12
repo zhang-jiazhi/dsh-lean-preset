@@ -195,7 +195,7 @@ test('missing or empty skills and provider failures never claim a successful loa
   f.definitions.get('brainstorming').content = ''
   assert.match((await f.load(a)).text, /no loadable body/)
   f.ctx.skills.get = async () => { throw new Error('provider unavailable') }
-  assert.match((await f.load(a)).text, /skill_load failed/)
+  await assert.rejects(f.load(a), /provider unavailable/)
   assert.equal(a.inbox.nextStep.length, 0)
 })
 

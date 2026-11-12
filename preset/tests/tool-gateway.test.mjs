@@ -3,6 +3,11 @@ import { test } from 'node:test'
 import { apply as gateway } from '../tool-gateway.mjs'
 import { markGatewayEligible } from '../gateway-policy.mjs?release=20261106-fixes'
 
+const registryView = (definitions, conditions = new Map()) => ({
+  visible: definitions,
+  registrations: new Map([...definitions].map(([name, definition]) => [name, { definition, when: conditions.get(name) }])),
+})
+
 const fixture = () => {
   let tool
   const executed = []
@@ -46,20 +51,21 @@ const fixture = () => {
   for (const definition of definitions.values()) markGatewayEligible(definition)
   const tools = {
     register(value) { tool = value },
-    view() { return { visible: definitions } },
+    view() { return registryView(definitions) },
     async execute(input) {
       executed.push(input)
       const name = input.calls[0]?.name
-      const image = name === 'hidden_image'
       return {
-        results: [{
+        results: input.calls.map(call => ({
+          callId: call.id,
           result: {
-            content: image
+            isError: false,
+            content: call.name === 'hidden_image'
               ? [{ type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png', width: 1, height: 1 } }]
               : [{ type: 'text', text: 'hidden result' }],
             value: { ok: true },
           },
-        }],
+        })),
         ...(name === 'hidden_context'
           ? { additionalContexts: [{ role: 'user', content: [{ type: 'text', text: 'injected' }] }], concluded: true }
           : {}),
@@ -107,13 +113,11 @@ test('a search for directly visible tools names them instead of dead-ending', as
     output: { schema: { type: 'object' }, render: () => [] },
     execute: async () => ({}),
   })
-  f.tools.view = () => ({
-    visible: new Map([...f.definitions,
+   f.tools.view = () => registryView(new Map([...f.definitions,
       ['bash', resident('bash')],
       ['list_agents', resident('list_agents')],
       ['team_task_list', resident('team_task_list')],
-    ]),
-  })
+    ]))
   const hit = await f.tool.execute({ action: 'search', query: 'list_agents team members' }, { agent: {} })
   assert.match(hit.text, /No gateway-eligible tools match/)
   assert.match(hit.text, /list_agents/)
@@ -195,19 +199,20 @@ test('unknown non-Chinese keys are named too, and valid keys stay untouched', as
   assert.match(ok.text, /gateway tools/)
 })
 
-test('a settled call without a result returns an empty completion instead of throwing', async () => {
+test('missing canonical results are protocol errors, never successful empty output', async () => {
   const f = fixture()
-  f.tools.execute = async () => ({ results: [{}] })
-  const out = await f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} })
-  assert.match(out.text, /completed with no output/)
-  f.tools.execute = async () => ({ results: [{ content: [{ type: 'text', text: 'kept' }] }] })
-  const kept = await f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} })
-  assert.equal(kept.text, 'kept')
-  f.tools.execute = async () => ({ results: [{ isError: true, error: { message: 'boom' } }] })
-  await assert.rejects(
-    f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} }),
-    /boom/,
-  )
+  for (const envelope of [undefined, {}, { results: [] }, { results: [{}] },
+    { results: { 0: { result: { content: [] } } } }, { results: [{ result: null }] }, { results: [{ result: [] }] },
+    { results: [{ content: [{ type: 'text', text: 'not canonical' }] }] },
+    { results: [{ isError: true, error: { message: 'boom' } }] }]) {
+    f.tools.execute = async () => envelope
+    await assert.rejects(
+      f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} }),
+      /tool result protocol error.*outcome unknown/,
+    )
+  }
+  f.tools.execute = async () => ({ results: [{ result: { isError: false, content: [] } }] })
+  assert.match((await f.tool.execute({ action: 'call', name: 'hidden_read', input: {} }, { agent: {} })).text, /completed with no output/)
 })
 
 test('call delegates through tools.execute with a private tool set', async () => {
@@ -298,7 +303,7 @@ test('unmarked and conditional tools are not exposed or callable', async () => {
   const unmarked = { name: 'unmarked', description: 'not marked', parameters: { type: 'object', properties: {} }, output: { schema: { type: 'object' }, render: () => [] }, execute: async () => ({}) }
   const conditional = { name: 'conditional', description: 'has when', parameters: { type: 'object', properties: {} }, output: { schema: { type: 'object' }, render: () => [] }, execute: async () => ({}) }
   markGatewayEligible(conditional, () => true)
-  f.tools.view = () => ({ visible: new Map([...f.definitions, ['unmarked', unmarked], ['conditional', conditional]]) })
+  f.tools.view = () => registryView(new Map([...f.definitions, ['unmarked', unmarked], ['conditional', conditional]]), new Map([['conditional', () => true]]))
   assert.doesNotMatch((await f.tool.execute({ action: 'list' }, { agent: {} })).text, /unmarked|conditional/)
   await assert.rejects(f.tool.execute({ action: 'call', name: 'unmarked' }, { agent: {} }), /not gateway-eligible/)
   // A conditional tool is not merely unknown: say why the gateway cannot serve it.
@@ -347,7 +352,7 @@ test('search prefers phrase precision and comma-separated alternatives', async (
     definitions.set(name, definition)
   }
   let tool
-  gateway({ tools: { register(value) { tool = value }, view() { return { visible: definitions } } } })
+  gateway({ tools: { register(value) { tool = value }, view() { return registryView(definitions) } } })
 
   const phrase = await tool.execute({ action: 'search', query: 'terminal list' }, { agent: {} })
   assert.match(phrase.text, /terminal_list/)
@@ -402,7 +407,7 @@ test('list pages through the whole catalog instead of hiding the tail', async ()
     definitions.set(name, definition)
   }
   let tool
-  gateway({ tools: { register(value) { tool = value }, view() { return { visible: definitions } }, async execute() { return { results: [] } } } })
+  gateway({ tools: { register(value) { tool = value }, view() { return registryView(definitions) }, async execute() { return { results: [] } } } })
   const seen = new Set()
   let offset = 0
   for (let page = 0; page < 10; page += 1) {
@@ -476,7 +481,7 @@ test('a call missing required schema properties names all of them at once', asyn
   gateway({
     tools: {
       register(value) { registered = value },
-      view() { return { visible: definitions } },
+      view() { return registryView(definitions) },
       async execute(input) { executed.push(input); return { results: [{ result: { content: [{ type: 'text', text: 'ok' }] } }] } },
     },
   })
@@ -511,6 +516,8 @@ test('action="call" with calls[] runs a validated batch in one step', async () =
   assert.deepEqual(f.executed[0].calls.map(call => call.name), ['hidden_read', 'hidden_image'])
   assert.match(batched.text, /## hidden_read/)
   assert.match(batched.text, /## hidden_image/)
+  assert.deepEqual(batched.statuses.map(item => item.status), ['ok', 'ok'])
+  assert.equal(batched.content.some(block => block.type === 'image'), true)
 
   // A bad item fails the whole batch before anything executes.
   f.executed.length = 0

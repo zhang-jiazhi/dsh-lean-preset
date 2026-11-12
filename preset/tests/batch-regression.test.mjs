@@ -1,18 +1,17 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-// Resolve the sibling plugin in both supported layouts:
-//   installed:  ~/.dsh/.agent-presets/lean/tests -> ~/.dsh/local-plugins/dsh-lean-batch
-//   repository: <repo>/preset/tests              -> <repo>/plugins/dsh-lean-batch
-const pluginUrl = ['../../../local-plugins/dsh-lean-batch/lib/index.js', '../../plugins/dsh-lean-batch/lib/index.js']
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+// Two layouts: the live install keeps local plugins under ~/.dsh/local-plugins,
+// the published mirror vendors them under plugins/. Resolve whichever exists.
+const batchModule = ['../../../local-plugins/dsh-lean-batch/lib/index.js', '../../plugins/dsh-lean-batch/lib/index.js']
   .map(relative => new URL(relative, import.meta.url))
   .find(url => existsSync(fileURLToPath(url)))
-if (pluginUrl === undefined) throw new Error('dsh-lean-batch plugin not found in the installed or repository layout')
-const { apply: batch, normalizeProgram, repairArguments, planGlob } = await import(pluginUrl.href)
+const { apply: batch, normalizeProgram, repairArguments, planGlob } = await import(batchModule.href)
 import { stripTypeScriptTypes } from 'node:module'
 import { apply as discovery } from '../dev-tool-search.mjs'
 import { runtime } from './runtime-helper.mjs'

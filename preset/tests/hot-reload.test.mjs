@@ -153,7 +153,7 @@ test('a pre-20261106 prototype wrapper is detected and demands a real restart', 
   assert.ok(warnings.some(message => /pre-20261106 resolve wrapper/.test(message)), 'the legacy wrapper must be reported')
   assert.ok(warnings.some(message => /RESTART the host/.test(message)), 'the only safe migration is a restart')
   assert.equal(tools[INSTALL_KEY], undefined, 'the new generation must not wrap a closure it cannot read')
-  assert.ok(infos.some(message => /release 20261106-fixes active/.test(message)), 'the mounted release must be visible')
+  assert.ok(infos.some(message => /release 20261110-catalog active/.test(message)), 'the mounted release must be visible')
 })
 
 test('a legacy instance wrapper over a reachable prototype method is detached', async () => {

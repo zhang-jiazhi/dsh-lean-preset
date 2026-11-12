@@ -119,10 +119,10 @@ test('relative writes after cd follow the effective cwd', () => {
 
 test('tilde paths expand to the home directory', () => {
   const home = homedir()
-  const workspace = `${home}/projects/demo`
-  assert.ok(denied('cat > ~/projects/demo/src/x.ts <<EOF\nx\nEOF', workspace))
+  const workspace = `${home}/项目/demo`
+  assert.ok(denied('cat > ~/项目/demo/src/x.ts <<EOF\nx\nEOF', workspace))
   assert.ok(allowed('cat > ~/elsewhere/x.ts <<EOF\nx\nEOF', workspace))
-  assert.ok(denied('sed -i "s/a/b/" ~/projects/demo/src/x.ts', workspace))
+  assert.ok(denied('sed -i "s/a/b/" ~/项目/demo/src/x.ts', workspace))
 })
 
 test('middle state (default): shell writes pass, scripted writes to existing files do not', () => {

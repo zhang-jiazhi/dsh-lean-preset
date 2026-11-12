@@ -173,7 +173,7 @@ test('a global tool restricted away from the agent catalog is not gateway-eligib
   assert.equal(isGatewayEligible(definition), false)
 })
 
-test('tools/change re-reads the catalog so a late global tool still gets marked', async () => {
+test('tools/change reconciles a late inherited global registration', async () => {
   const bash = {
     name: 'bash', description: 'shell',
     parameters: { type: 'object', properties: {} },
@@ -196,13 +196,11 @@ test('tools/change re-reads the catalog so a late global tool still gets marked'
     [bash.name, { definition: bash, when: undefined }],
     [gatewayDefinition.name, { definition: gatewayDefinition, when: undefined }],
   ])
-  // The agent scope materialised before the late plugin registered: it never
-  // lists that name, so only the refreshed catalog can admit it.
-  const agentRegistrations = new Map(registrations)
+  // Real scoped views dynamically include current inherited global registrations.
   const tools = {
     register() { return () => {} },
-    view(scope) {
-      const source = scope === undefined ? registrations : agentRegistrations
+    view() {
+      const source = registrations
       const visible = new Map([...source].map(([name, entry]) => [name, entry.definition]))
       return { visible, registrations: source, knownNames: new Set(visible.keys()), restrictableNames: new Set(visible.keys()) }
     },
@@ -236,5 +234,5 @@ test('tools/change re-reads the catalog so a late global tool still gets marked'
   registrations.set(late.name, { definition: late, when: undefined })
   hooks.get('tools/change')?.()
   await new Promise(resolve => setTimeout(resolve, 0))
-  assert.equal(isGatewayEligible(late, agent), true, 'tools/change must refresh the cached catalog before re-marking')
+  assert.equal(isGatewayEligible(late, agent), true, 'the current scoped registration must receive its per-Agent mark')
 })

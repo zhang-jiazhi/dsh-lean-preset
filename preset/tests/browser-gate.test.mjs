@@ -26,7 +26,7 @@ const definition = (name) => ({
 class FakeTools {
   constructor(defs) {
     this.defs = defs
-    this.registrations = new Map()
+    this.registrations = new Map(defs.map(definition => [definition.name, { definition, when: undefined }]))
     this.byName = new Map(defs.map(entry => [entry.name, entry]))
     this.guardHandler = undefined
   }
@@ -56,7 +56,8 @@ class FakeTools {
     }
     return {
       visible: new Map(this.defs.map(entry => [entry.name, entry])),
-      registrations: new Map(),
+      // Real ToolsService includes inherited global registrations in scoped views.
+      registrations: new Map(this.registrations),
       knownNames: new Set(this.defs.map(entry => entry.name)),
       restrictableNames: new Set(this.defs.map(entry => entry.name)),
     }
@@ -120,7 +121,9 @@ const promote = (harnessRef) => {
 const view = async ({ tools, agent }) => [...(await tools.resolve({ agent, signal: new AbortController().signal })).view(agent).keys()].sort()
 
 test('a scoped MCP tool never reaches the lean catalog but stays gateway-reachable', async () => {
-  const click = definition('mcp__playwright-mcp__browser_click')
+  // Names the server the composition actually mounts (rc.2 disabled the
+  // browser-use provider, so mcp__playwright-mcp__* no longer exists).
+  const click = definition('mcp__playwright-persist__browser_click')
   const f = harness({ defs: [definition('bash'), definition('tool_gateway'), click], session: makeSession('scoped-mcp') })
   f.tools.register(click)
   sync(f.hooks, f.agent.session)
@@ -135,7 +138,7 @@ test('a scoped MCP tool never reaches the lean catalog but stays gateway-reachab
   }
   gateway({ tools: f.tools })
   const listed = await gatewayTool.execute({ action: 'search', query: 'browser_click' }, { agent: f.agent })
-  assert.match(listed.text, /mcp__playwright-mcp__browser_click/)
+  assert.match(listed.text, /mcp__playwright-persist__browser_click/)
 })
 
 test('a delegation child reaches subagent through its own gateway', async () => {

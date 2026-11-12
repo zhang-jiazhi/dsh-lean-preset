@@ -101,7 +101,7 @@
             # 20261106-fixes：跨代 resolve 状态共享/原子换代；Team 否定指令与
             # 运行时 Team-Lead 身份分离；gateway eligibility 按调用 Agent 判定。
             # 换入口文件 + release URL，确保仍在运行的宿主下一次装配拿到新实现。
-            name: '@local/dsh-agent-preset-lean/tool-bootstrap-entry-20261109-toolschange.mjs'
+            name: '@local/dsh-agent-preset-lean/tool-bootstrap-entry-20261110-catalog.mjs'
             config:
               # 20261031-toolhints2：edit/write 的 schema 描述尾部追加读证据约束
               #   （“edit 需要先 read；bash 写入会作废证据”）。真实会话 session-example
@@ -296,7 +296,7 @@
           #   （同一会话里 update_goal 连错两次：先 id/phase、再 expected_revision，第三次才成；
           #   预检会把 goal_id/action/revision 一次列全）。oneOf/anyOf/allOf 跳过，避免误杀。
           - id: tool-gateway
-            name: '@local/dsh-agent-preset-lean/tool-gateway-entry-20261109-observed4.mjs'
+            name: '@local/dsh-agent-preset-lean/tool-gateway-entry-20261112-rc2.mjs'
 
           # 20261017-audit-p1：在 tools/execute（pre-execute 之后、defineTool 校验之前）
           #   归一化模型参数：bash 缺 description 时补一行；sandbox_permissions 无有效
@@ -510,7 +510,7 @@
           # 20260924-failed-compaction：失败的压缩不丢技能版本（正文仍在对话里，
           # 重投只会白烧上下文）；只有真实检查点才允许重载。
           - id: skill-search
-            name: '@local/dsh-agent-preset-lean/skills-on-demand-entry-20260924-failed-compaction.mjs'
+            name: '@local/dsh-agent-preset-lean/skills-on-demand-entry-20261110-errors.mjs'
 
           # 单一来源 ~/.dsh/AGENTS.md：0 号核心自动注入，1–8 号专项按需；
           # 内容摘要确认版本，旧编号记录不冒充新版本。新模块路径供新会话直接装配。
@@ -942,6 +942,17 @@
           #      同预设会话（A 会话用完 stop，B 会话的工具跟着消失），属于把单例当会话态用。
           #   4. 真要省这 337 MB，正确做法是停用不需要的 server（删/加 disabled），
           #      代价是该 server 无法再被 tool_gateway 调用——这是配置选择，不是优化。
+          # 2026-11-12 补充（0.2.2-rc.2）：第 3 条已过时一半。rc.2 新增
+          #   @deepseek-ai/dsh-mcp-manager：`servers.<name>.enabled` 可实时改，
+          #   Settings 里 `mcp-manager` 条目 applies=live（当前 value.servers={}），
+          #   改完即挂载/卸载并同步工具。实测：从预设作用域 register 后根管理器可见，
+          #   dispose 后工具立即消失，LEAN 的 tools/change 重同步能直接接管。
+          #   但它**是全局单例**：写进去的 server 对所有 preset 生效。非 lean 预设不挂
+          #   LEAN 的掩码（standard/minimal 无该行，实测请求工具数 66–123），据此推断
+          #   REA 的 207 个 schema 会直接计入其请求（未逐 preset 实测）。lean 专属 server 继续
+          #   留在本文件的 mcp-client 行；manager 只适合“全局共享且默认关闭”的 server。
+          #   会话级装卸仍然不可用（A 卸载会带走 B），与第 3 条的告诫一致。
+          #   运维收益：manager 已通过 Remote 暴露 restart/probe/watch，MCP 卡死可无重启重连。
 
           # ── 持久登录态浏览器（原 mcp-playwright 行；2026-09-15 起与新 provider 并存）──────
           # 两套浏览器的分工（靠名字区分，勿再改回两者叫 playwright）：
@@ -1097,7 +1108,7 @@
               toolCallTimeoutMs: 450000
 
           # ── computer use：改用 dsh 自带实现（2026-10-28，dsh 0.2.2-alpha.2）──────────
-          # 已删除这里原有的两条 ZCode 逆向链路行（都指向 ~/projects/cua-server/
+          # 已删除这里原有的两条 ZCode 逆向链路行（都指向 ~/项目/cua-server/
           # run-mcp-server.sh，靠 ZCode.app 副本 + permission broker 的签名身份运作）：
           #   1) mcp-client 行 mcp-computer-use（serverName: computer-use）；
           #   2) computerUse 槽 isolate 组里的 experimental-computer-use-cua-driver-mcp。

@@ -89,7 +89,7 @@ const resolveAgentByTools = resolveRegistry.agentByTools
 /** This module instance's generation; bumped for every `?release=` import. */
 const GENERATION = ++resolveRegistry.generation
 /** Release tag imported by the matching entry file (also logged at mount). */
-const RELEASE = '20261106-fixes'
+const RELEASE = '20261110-catalog'
 
 /** Durable session event types that count as a promotion signal per mode. */
 const PROMOTE_EVENTS = {
@@ -405,15 +405,20 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     }
   }
 
+  const exposureCatalogByAgent = new WeakMap()
+  let catalogRevision = 0
+  const sameRegistrations = (left, right) => {
+    if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false
+    for (const [toolName, registration] of right) if (left.get(toolName) !== registration) return false
+    return true
+  }
   const promotion = createEpochPromotion(promoteEvents, { includeSubagents })
   ctx.on('session/event', (session, event) => {
     promotion.observe(session, event)
     observeUnlock(session, event)
     observeUserPrompt(session, event)
-    // 0.2.2 exposure sync points (see the exposure block below). `turn/start`
-    // and `compaction/end` can change the phase and are safe places to re-read
-    // an unrestricted catalog; `step/end` is past the tool batch, so unlocks
-    // recorded during the step land before the next step resolves its set.
+    // Phase/unlock changes still reconcile keep, but only registry changes
+    // invalidate the deep-cloned schema snapshot.
     const type = event?.type
     // The mask must be in place BEFORE the loop resolves the step's tool set.
     // Measured on 0.2.2-alpha.2: `turn/start` reaches session listeners after
@@ -421,9 +426,9 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     // request #1 on the full catalog (383 schemas observed). `agent/inbox/spliced`
     // lands when the user message arrives — before the loop opens the turn — and
     // `turn/end` covers the next turn's starting point.
-    if (type === 'agent/inbox/spliced' || type === 'turn/end') syncExposure(session, true)
-    else if (type === 'turn/start' || type === 'compaction/end') syncExposure(session, true)
-    else if (type === 'step/end') syncExposure(session, true)
+    if (type === 'agent/inbox/spliced' || type === 'turn/end') syncExposure(session)
+    else if (type === 'turn/start' || type === 'compaction/end') syncExposure(session)
+    else if (type === 'step/end') syncExposure(session)
   })
 
   /**
@@ -449,7 +454,10 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     unlockedBySession.delete(session.id)
     teamStateBySession.delete(session.id)
     const disposedAgent = typeof ctx.get === 'function' ? ctx.get('agents')?.get?.(session.id) : undefined
-    if (disposedAgent !== undefined && disposedAgent !== null) resolveStateByAgent.delete(disposedAgent)
+    if (disposedAgent !== undefined && disposedAgent !== null) {
+      resolveStateByAgent.delete(disposedAgent)
+      exposureCatalogByAgent.delete(disposedAgent)
+    }
     // Drop the catalog snapshot with the session: a lingering snapshot would
     // follow a reused id.
     forgetCatalog(session.id)
@@ -1114,9 +1122,8 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
   /**
    * Reconcile one session's exposure mask.
    * @param session - durable Session.
-   * @param refresh - lift the mask first to read an unrestricted catalog.
    */
-  const syncExposure = (session, refresh) => {
+  const syncExposure = (session) => {
     if (session === undefined || session === null) return
     const agents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
     const agent = agents?.get?.(session.id)
@@ -1127,21 +1134,23 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
     // registry as a fallback.
     const toolsService = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
     try {
-      const cached = catalogFor(session.id)
-      let catalog = cached
-      if (refresh === true || !Array.isArray(cached)) {
-        catalog = (() => {
-          try {
-            if (toolsService !== undefined && typeof toolsService.schemas === 'function') {
-              return toolsService.schemas(agent)
-            }
-            return typeof agent?.ctx?.tools?.schemas === 'function' ? agent.ctx.tools.schemas(agent) : []
-          } catch {
-            return []
-          }
-        })()
-        rememberCatalog(session.id, catalog)
+      const scopedTools = toolsService ?? agent?.ctx?.tools
+      const agentView = typeof scopedTools?.view === 'function' ? scopedTools.view(agent) : undefined
+      const registrations = agentView?.registrations
+      const previous = exposureCatalogByAgent.get(agent)
+      let catalog = previous?.catalog
+      // Registration identity also catches a mutation before tools/change's
+      // coalesced callback runs. No snapshots are shared across Agent scopes.
+      if (!Array.isArray(catalog) || previous.revision !== catalogRevision
+        || (registrations instanceof Map && !sameRegistrations(previous.registrations, registrations))) {
+        catalog = typeof scopedTools?.schemas === 'function' ? scopedTools.schemas(agent) : []
+        if (!Array.isArray(catalog)) throw new Error('tool schemas must return an array')
+        exposureCatalogByAgent.set(agent, {
+          catalog, revision: catalogRevision,
+          registrations: registrations instanceof Map ? new Map(registrations) : undefined,
+        })
       }
+      rememberCatalog(session.id, catalog)
       // The gateway the CURRENT caller cannot see is exactly what it may call
       // through the gateway. Eligibility is therefore marked per Agent against
       // this Agent's kept set, not against the union of every configured list:
@@ -1161,25 +1170,9 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
         }
         markGatewayEligible(registration.definition, registration.when, agent)
       }
-      // Only definitions that are visible in this agent's catalog after other
-      // plugins' restrictions may be reached: a global tool hidden by an
-      // unrelated plugin's `when` must stay unavailable, and a conditional tool
-      // keeps its own condition for the gateway to re-evaluate.
-      const visibleNames = new Set(catalogNamesOf(catalog))
-      const globalView = toolsService !== undefined && typeof toolsService.view === 'function'
-        ? toolsService.view()
-        : undefined
-      if (globalView !== undefined) {
-        for (const [toolName, registration] of globalView.registrations) {
-          if (!visibleNames.has(toolName)) continue
-          markHiddenForAgent(toolName, registration)
-        }
-      }
-      // The browser/MCP provider opens a child scope and registers tools after
-      // some earlier sync points; mark those already-created registrations too.
-      const agentView = toolsService !== undefined && typeof toolsService.view === 'function'
-        ? toolsService.view(agent)
-        : undefined
+      // The effective scoped view already includes inherited global tools and
+      // applies restrictions/shadows. A separate global pass is redundant and
+      // can leave misleading marks for definitions this Agent cannot use.
       if (agentView !== undefined) {
         for (const [toolName, registration] of agentView.registrations) {
           markHiddenForAgent(toolName, registration)
@@ -1286,16 +1279,15 @@ export function apply(ctx, config) {  const source = config === undefined ? {} :
   installResolveFilter()
 
   ctx.on('tools/change', () => {
+    catalogRevision += 1
     if (toolsChangeScheduled) return
     toolsChangeScheduled = true
     queueMicrotask(() => {
       toolsChangeScheduled = false
       const currentAgents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
-      // 20261109-toolschange：refresh=true。以前这里读缓存目录，`visibleNames`
-      // 可能是注册前的快照，导致晚注册/重注册的工具被跳过、拿不到 eligibility
-      // 标记 —— 模型既看不到、网关又说 not gateway-eligible，成了死角
-      // （实测：job_output、mcp__ida__list_databases）。
-      for (const agent of currentAgents?.list?.() ?? []) syncExposure(agent.session, true)
+      // Invalidate synchronously, refresh once per burst. A step that already
+      // observed this revision need not project the same schemas again.
+      for (const agent of currentAgents?.list?.() ?? []) syncExposure(agent.session)
     })
   })
 

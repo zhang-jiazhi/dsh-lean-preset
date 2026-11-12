@@ -7,7 +7,7 @@
  * one behaviour prompts could not fix: bash file mutations bypass `fs/observed`,
  * so a later `edit` fails with "file changed since it was read".
  *
- * Measured in session-example-b (672 steps, 646 calls): ~70% of file mutations
+ * Measured in session-example (672 steps, 646 calls): ~70% of file mutations
  * went through bash (29 × `python3 - <<PY` in-place replace, 2 × `cat >`,
  * `sed -i`), and exactly those writes bypass the read evidence `edit` needs.
  *

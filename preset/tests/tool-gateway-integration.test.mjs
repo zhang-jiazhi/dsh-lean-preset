@@ -143,6 +143,14 @@ test('a batch keeps image content and reports partial failure', async () => {
   const failure = result.content.find(block => block.type === 'text' && block.text.startsWith('## hidden_failure'))
   assert.match(failure.text, /ERROR: required parameter missing/)
   assert.match(result.text, /## hidden_image/)
+  assert.deepEqual(result.statuses.map(item => item.status), ['ok', 'error'])
+  const logged = await tools.execute({
+    calls: [{ id: 'partial-batch', name: 'tool_gateway', arguments: JSON.stringify({
+      action: 'call', calls: [{ name: 'hidden_image' }, { name: 'hidden_failure' }],
+    }) }],
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(logged.results[0].result.meta.gatewayCalls.map(item => item.status), ['ok', 'error'])
 
   await assert.rejects(
     gateway.execute({
